@@ -102,8 +102,8 @@ def write_csv(filename, episodes, fieldnames):
         writer.writerows(episodes)
 
 def extract_tms_id(text, prefix='EP'):
-    pattern = f'{prefix}\\d+' 
-    match = re.search(pattern, text)
+    pattern = f'{prefix}\\d+'
+    match = re.search(pattern, text or '', flags=re.IGNORECASE)
     return match.group(0) if match else None
 
 # --- Helper functions for robust text input and normalization ---
@@ -761,25 +761,31 @@ def robust_clear_and_type(element, text, driver):
 def try_select_autocomplete_series(driver, wait, series_title):
     """
     Try to select a series from the autocomplete dropdown suggestions.
-    If there are multiple SERIES options with the same title (even if they are off-screen
-    in a scrollable list), do not select anything so the caller can defer for user choice.
-    Returns True only if a single, unambiguous SERIES option is found and clicked.
+    If there are multiple exact-title matches, only auto-click when exactly one looks SERIES-like.
+    SERIES-like is detected by either:
+      - explicit 'series' label in option text, OR
+      - presence of an SH id in option text/HTML.
     """
     try:
         # Wait for the popper or listbox to appear
         wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "ul[role='listbox'], div[role='listbox'], .MuiAutocomplete-popper [role='listbox']")) > 0)
-        # Get the scrollable container for options
         containers = driver.find_elements(By.CSS_SELECTOR, "ul[role='listbox'], div[role='listbox'], .MuiAutocomplete-popper [role='listbox']")
         if not containers:
             return False
         container = containers[0]
 
-        # Helper to collect current option elements
         def collect_options():
             opts = driver.find_elements(By.CSS_SELECTOR, "[role='option'], ul[role='listbox'] li, div[role='listbox'] li, [data-option-index]")
             if not opts:
                 opts = driver.find_elements(By.XPATH, "//div[contains(@class,'Autocomplete') or contains(@class,'popper') or @role='listbox']//li")
-            return [o for o in opts if o.is_displayed()]
+            out = []
+            for o in opts:
+                try:
+                    if o.is_displayed():
+                        out.append(o)
+                except Exception:
+                    pass
+            return out
 
         # Scroll to top first
         try:
@@ -798,7 +804,7 @@ def try_select_autocomplete_series(driver, wait, series_title):
                 stable_iters = 0
             seen_count = len(options)
 
-            # Try to scroll down a page
+            # Scroll down
             try:
                 driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight * 0.9;", container)
             except Exception:
@@ -807,37 +813,54 @@ def try_select_autocomplete_series(driver, wait, series_title):
                 except Exception:
                     pass
 
-            # Stop when no new options appear after a couple of iterations
             if stable_iters >= 2:
                 break
             time.sleep(0.15)
 
-        # Final collect after scrolling
         options = collect_options()
-
         target_norm = normalize_text(extract_clean_title(series_title))
-        exact_series = []
+
+        exact = []
         for el in options:
             txt = (el.text or '').strip()
             title_clean = extract_clean_title(txt)
-            if normalize_text(title_clean) == target_norm and has_series_label(txt):
-                exact_series.append(el)
-
-        if len(exact_series) == 1:
-            # Make sure it is on-screen and click it
+            if normalize_text(title_clean) != target_norm:
+                continue
+            inner = ''
             try:
-                _scroll_into_view(driver, exact_series[0])
+                inner = el.get_attribute('innerHTML') or ''
+            except Exception:
+                inner = ''
+            series_like = has_series_label(txt) or bool(extract_tms_id(txt, 'SH')) or bool(extract_tms_id(inner, 'SH'))
+            exact.append((el, series_like))
+
+        if not exact:
+            return False
+
+        # If there is exactly one exact-title option, click it.
+        if len(exact) == 1:
+            el = exact[0][0]
+            try:
+                _scroll_into_view(driver, el)
             except Exception:
                 pass
-            exact_series[0].click()
+            el.click()
             time.sleep(1.5)
             return True
 
-        if len(exact_series) > 1:
-            print_warning(f"Multiple series named '{series_title}' in autocomplete (after scroll) - deferring")
-            return False
+        # Multiple exact matches: only click if exactly one is series-like
+        series_only = [t for t in exact if t[1]]
+        if len(series_only) == 1:
+            el = series_only[0][0]
+            try:
+                _scroll_into_view(driver, el)
+            except Exception:
+                pass
+            el.click()
+            time.sleep(1.5)
+            return True
 
-        # No exact SERIES match; allow caller to submit search and resolve in grid
+        print_warning(f"Multiple autocomplete matches for '{series_title}' - letting grid/user resolve")
         return False
     except Exception:
         return False
@@ -865,60 +888,72 @@ def click_programs_sidebar(driver, wait):
 
 def select_series_filter(driver, wait):
     print_step("Selecting 'SERIES' filter...")
-    # The SERIES filter is present, but can take a few seconds to become clickable.
     timeout = float(CONFIG.get('wait_timeout', 10) or 10)
     end = time.time() + timeout
 
-    # Prefer the exact, previously working selector first.
+    def _looks_selected(el):
+        try:
+            ap = (el.get_attribute('aria-pressed') or '').strip().lower()
+            if ap == 'true':
+                return True
+        except Exception:
+            pass
+        try:
+            a = (el.get_attribute('aria-selected') or '').strip().lower()
+            if a == 'true':
+                return True
+        except Exception:
+            pass
+        try:
+            cls = (el.get_attribute('class') or '').lower()
+            if 'selected' in cls or 'active' in cls or 'mui-selected' in cls:
+                return True
+        except Exception:
+            pass
+        return False
+
+    # Anchor to the "Filter by Program Type" label if present
+    anchor = None
+    try:
+        anchor = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Filter by Program Type')]")
+    except Exception:
+        anchor = None
+
+    xpaths = [
+        ".//following::*[(self::button or self::div or self::span) and normalize-space(.)='SERIES'][1]",
+        ".//following::*[(self::button or self::div or self::span) and normalize-space(.)='Series'][1]",
+        "//*[self::button or self::div or self::span][normalize-space(.)='SERIES']",
+        "//*[@role='button' and normalize-space(.)='SERIES']",
+        "//*[self::button or self::div or self::span][normalize-space(.)='Series']",
+        "//*[@role='button' and normalize-space(.)='Series']",
+    ]
+
     while time.time() < end:
         try:
-            series_buttons = driver.find_elements(
-                By.XPATH,
-                "//button[normalize-space(.)='SERIES' or normalize-space(.)='Series']"
-            )
-            for btn in series_buttons:
+            scope = anchor if anchor is not None else driver
+            for xp in xpaths:
                 try:
-                    if not btn.is_displayed():
-                        continue
-                    if _click_el(driver, btn):
-                        time.sleep(0.8)
-                        print_success("SERIES filter applied")
-                        return True
+                    els = scope.find_elements(By.XPATH, xp)
                 except Exception:
-                    continue
+                    els = []
+                for el in els:
+                    try:
+                        if not el.is_displayed():
+                            continue
+                        if _looks_selected(el):
+                            print_success('SERIES filter already selected')
+                            return True
+                        if _click_el(driver, el):
+                            time.sleep(0.6)
+                            print_success('SERIES filter applied')
+                            return True
+                    except Exception:
+                        continue
         except Exception:
             pass
         time.sleep(0.2)
 
-    # As a fallback, try role=button with exact text match.
-    try:
-        btn = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.XPATH, "//*[@role='button' and (normalize-space(.)='SERIES' or normalize-space(.)='Series')]"))
-        )
-        if _click_el(driver, btn):
-            time.sleep(0.8)
-            print_success("SERIES filter applied")
-            return True
-    except Exception:
-        pass
-
-    # Debug aid: show a small sample of visible buttons if we still cannot click SERIES
-    try:
-        visible = []
-        for b in driver.find_elements(By.XPATH, "//button"):
-            try:
-                if b.is_displayed():
-                    t = (b.text or "").strip()
-                    if t:
-                        visible.append(t)
-            except Exception:
-                continue
-        if visible:
-            print_warning(f"Could not click SERIES filter. Visible buttons include: {visible[:12]}")
-    except Exception:
-        pass
-
-    print_warning("SERIES filter not clicked (may already be selected). Continuing anyway.")
+    print_warning('SERIES filter not clicked (may already be selected). Continuing anyway.')
     return True
 
 def search_for_series(driver, wait, series_title):
@@ -949,74 +984,100 @@ def search_for_series(driver, wait, series_title):
         return False
 
 def click_best_series_match(driver, wait, series_title, state):
-    print_step("Analyzing search results for best match...")
+    print_step('Analyzing search results for best match...')
     try:
-        # If we are already on a series page, skip clicking
+        if is_on_series_page(driver):
+            print_success('Already on a series page')
+            return 'ok'
+    except Exception:
+        pass
+
+    # Wait briefly for results links
+    try:
+        wait.until(lambda d: len(d.find_elements(By.XPATH, "//a[contains(@href, '/program-details')]")) > 0)
+    except Exception:
+        print_error('No results found after search')
+        return 'fail'
+
+    results = driver.find_elements(By.XPATH, "//a[contains(@href, '/program-details')]")
+    if not results:
+        print_error('No series results found')
+        return 'fail'
+
+    norm_target = normalize_text(extract_clean_title(series_title))
+
+    def _get_text(el):
         try:
-            if 'program-details' in driver.current_url or extract_tms_id(driver.current_url, 'SH'):
-                print_success("Already on a series page")
-                return "ok"
-            _ = driver.find_element(By.XPATH, "//*[contains(text(), 'Seasons & Episodes')]")
-            print_success("Already on a series page")
-            return "ok"
+            t = (el.text or '').strip()
+            if t:
+                return t
+        except Exception:
+            pass
+        for attr in ('aria-label', 'title'):
+            try:
+                t = (el.get_attribute(attr) or '').strip()
+                if t:
+                    return t
+            except Exception:
+                pass
+        try:
+            t = (el.get_attribute('textContent') or '').strip()
+            if t:
+                return t
+        except Exception:
+            pass
+        return ''
+
+    exact = []
+    for el in results:
+        txt = _get_text(el)
+        href = el.get_attribute('href') or ''
+        title_clean = extract_clean_title(txt)
+        is_series = bool(extract_tms_id(href, 'SH')) or has_series_label(txt) or bool(extract_tms_id(txt, 'SH'))
+        if normalize_text(title_clean) == norm_target:
+            exact.append((el, is_series))
+
+    # One exact-title result: click it even if text lacks 'Series'
+    if len(exact) == 1:
+        if _click_el(driver, exact[0][0]):
+            time.sleep(2)
+            print_success('Series page loaded')
+            return 'ok'
+        return 'fail'
+
+    # Multiple exact-title results: only auto-click if exactly one is series-like
+    if len(exact) > 1:
+        series_only = [t for t in exact if t[1]]
+        if len(series_only) == 1:
+            if _click_el(driver, series_only[0][0]):
+                time.sleep(2)
+                print_success('Series page loaded')
+                return 'ok'
+        print_warning(f"Multiple series named '{series_title}' found - deferring for user choice")
+        return 'ambiguous'
+
+    # Fallback: click the only result with an SH id in href
+    sh_results = []
+    for el in results:
+        try:
+            href = el.get_attribute('href') or ''
+            if extract_tms_id(href, 'SH'):
+                sh_results.append(el)
         except Exception:
             pass
 
-        # Wait for results to load
-        time.sleep(1)
-
-        # Gather candidate elements that could represent program tiles or links
-        results = driver.find_elements(By.XPATH, "//a[contains(@href, '/program-details')]")
-
-        # If none found, fall back to any visible element in results area that contains the title text
-        if not results:
-            candidates = driver.find_elements(By.XPATH, "//*[self::a or self::div or self::li][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), %s)]" % ("'" + series_title.lower() + "'"))
-            # Try to reduce to clickable anchors within those candidates
-            temp = []
-            for el in candidates:
-                try:
-                    a = el.find_element(By.XPATH, ".//a[contains(@href, '/program-details')]")
-                    temp.append(a)
-                except Exception:
-                    if el.tag_name.lower() == 'a':
-                        temp.append(el)
-            results = temp
-
-        if len(results) == 0:
-            print_error("No series results found")
-            return "fail"
-
-        # Detect ambiguity: multiple SERIES tiles with the same title (ignoring year)
-        norm_target = normalize_text(extract_clean_title(series_title))
-        series_exact = []
-        for el in results:
-            txt = (el.text or '').strip()
-            title_clean = extract_clean_title(txt)
-            if normalize_text(title_clean) == norm_target and has_series_label(txt):
-                series_exact.append(el)
-
-        if len(series_exact) > 1:
-            print_warning(f"Multiple series named '{series_title}' found - deferring for user choice")
-            return "ambiguous"
-
-        if len(series_exact) == 1:
-            target = series_exact[0]
-            try:
-                wait.until(EC.element_to_be_clickable(target))
-            except Exception:
-                pass
-            target.click()
+    if len(sh_results) == 1:
+        if _click_el(driver, sh_results[0]):
             time.sleep(2)
-            print_success("Series page loaded")
+            print_success('Series page loaded (SH href fallback)')
             return 'ok'
 
-        # No exact SERIES match for the title, do not guess
-        print_warning("No exact SERIES match for title in results")
-        return "not_found"
-            
-    except Exception as e:
-        print_error(f"Error clicking series: {e}")
-        return "fail"
+    if len(sh_results) > 1:
+        print_warning(f"Multiple SH series candidates for '{series_title}' - deferring for user choice")
+        return 'ambiguous'
+
+    print_warning('No exact SERIES match for title in results')
+    return 'not_found'
 
 def extract_series_tms_id(driver):
     """
@@ -1142,7 +1203,7 @@ def _collect_series_from_autocomplete(driver, target_norm):
         for el in options:
             txt = (el.text or '').strip()
             title_clean = extract_clean_title(txt)
-            if normalize_text(title_clean) == target_norm and has_series_label(txt):
+            if normalize_text(title_clean) == target_norm and (has_series_label(txt) or bool(extract_tms_id(txt, 'SH')) or bool(extract_tms_id(el.get_attribute('innerHTML') or '', 'SH'))):
                 sh = extract_tms_id(txt, 'SH') or extract_tms_id(el.get_attribute('innerHTML') or '', 'SH')
                 out.append({'el': el, 'text': txt, 'sh': sh})
         return out
@@ -1186,7 +1247,7 @@ def resolve_series_with_user(driver, wait, series_title, state):
 
     # Go to Programs and apply SERIES filter
     if not click_programs_sidebar(driver, wait):
-        return False
+        return "fail"
     select_series_filter(driver, wait)
 
     # Focus search box and show the autocomplete
@@ -1198,13 +1259,17 @@ def resolve_series_with_user(driver, wait, series_title, state):
         time.sleep(0.6)
     except Exception as e:
         print_error(f"Could not focus search input: {e}")
-        return False
+        return "fail"
 
     print("\nMultiple SERIES share this exact title.")
     print("Please do this in the browser window now:")
     print("  1) Use the Program search drop-down and CLICK the correct SERIES")
     print("     - or press Enter in the search box to open the grid, then CLICK the correct tile")
-    input("After you have clicked and the series page opens, press ENTER here to continue...")
+    resp = input("After you have clicked and the series page opens, press ENTER here to continue (or type 'skip' to skip this entire series)... ").strip().lower()
+    if resp in ('skip', 's'):
+        state.setdefault('skipped_series', set()).add(series_key)
+        print_warning(f"User chose to skip series '{series_title}'")
+        return "skip"
 
     # Wait briefly for the details page to be visible
     try:
@@ -1224,7 +1289,7 @@ def resolve_series_with_user(driver, wait, series_title, state):
     state['current_series'] = series_title
     state['on_seasons_tab'] = False
     state['current_season'] = None
-    return True
+    return "ok"
 
 
 def click_seasons_episodes_tab(driver, wait):
@@ -1807,7 +1872,16 @@ def main():
                 series_title = eps[0].get('SeriesTitle') or eps[0].get('Series') or eps[0].get('series_title') or eps[0].get('Show') or ''
                 if key not in state['series_choice_cache']:
                     # Prompt user to choose by clicking in the UI
-                    if not resolve_series_with_user(driver, wait, series_title, state):
+                    status = resolve_series_with_user(driver, wait, series_title, state)
+                    if status == "skip":
+                        # Mark all episodes in this series as skipped so future runs skip them up front
+                        for ep in eps:
+                            ep['EpisodeTMSID'] = '1'
+                            ep['Notes'] = 'Skipped series by user'
+                        write_csv(CONFIG['output_csv'], episodes, fieldnames)
+                        print_success(f"Series skipped, progress saved to {CONFIG['output_csv']}")
+                        continue
+                    if status != "ok":
                         for ep in eps:
                             ep['Notes'] = ep.get('Notes', '') or 'Could not resolve ambiguous series'
                         continue
