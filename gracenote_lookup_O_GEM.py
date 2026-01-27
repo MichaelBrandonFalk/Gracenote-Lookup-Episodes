@@ -22,7 +22,6 @@ from selenium.webdriver.common.keys import Keys
 from webdriver_manager.chrome import ChromeDriverManager
 
 # Configuration
-# Configuration
 CONFIG = {
     'input_csv': 'InputEpisodes.csv',
     'output_csv': 'OutputEpisodes_WithTMSIDs.csv',
@@ -30,43 +29,32 @@ CONFIG = {
     'wait_timeout': 10,
     'delay_between_episodes': 2,
     'second_pass_only': False,
-    'ignore_season_search': False,
+    'ignore_season_on_second_pass': False  # <--- Add this line
 }
 
 
 def prompt_mode_choice():
-    """
-    Ask the user which mode to run: normal two-pass or second pass only.
-    Sets CONFIG['second_pass_only'] based on the answer.
-    """
     try:
         print("\nRun mode:")
         print("  1) Normal two-pass workflow")
         print("  2) Second pass only (skip first pass)")
         choice = input("Choose 1 or 2 [1]: ").strip()
-        if choice == '2':
-            CONFIG['second_pass_only'] = True
-            print_success("Second pass only mode enabled")
+        CONFIG['second_pass_only'] = (choice == '2')
+        
+        # Add the new toggle prompt here
+        print("\nSeason handling for second pass:")
+        print("  1) Search specific season from CSV")
+        print("  2) Ignore season number (search entire series)")
+        s_choice = input("Choose 1 or 2 [1]: ").strip()
+        if s_choice == '2':
+            CONFIG['ignore_season_on_second_pass'] = True
+            print_success("Ignore Season enabled for second pass")
         else:
-            CONFIG['second_pass_only'] = False
-            print_success("Normal mode selected")
+            CONFIG['ignore_season_on_second_pass'] = False
+            print_success("Specific season matching enabled")
+            
     except Exception:
-        # Fallback to default if input fails
-        print_warning("Could not read input. Using default mode")
-
-def prompt_ignore_season_choice():
-    """Ask the user whether to ignore season filtering when searching for episodes."""
-    try:
-        choice = input("Ignore season filter? (y/N): ").strip().lower()
-        if choice in ('y', 'yes'):
-            CONFIG['ignore_season_search'] = True
-            print_success("Ignore season filter enabled")
-        else:
-            CONFIG['ignore_season_search'] = False
-            print_success("Ignore season filter disabled")
-    except Exception:
-        print_warning("Could not read input. Using default ignore season setting")
-
+        print_warning("Could not read input. Using default settings.")
 
 # ---------------------------------------------------------------------------
 # No persistence across runs
@@ -1503,6 +1491,7 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
             except Exception:
                 pass
         return tms_id
+
     def forward_walk():
         """Scan current page, then walk forward through pages until visited loops or Next is unavailable."""
         visited = set()
@@ -1544,64 +1533,7 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
             steps += 1
         return None
 
-    def _get_season_candidates(max_fallback=30):
-        """Return an ordered list of season numbers (as strings) that appear selectable in the UI."""
-        # 1) Prefer native <select> options when available
-        try:
-            dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
-            if dropdowns:
-                sel = Select(dropdowns[0])
-                nums = []
-                for opt in sel.options:
-                    n = normalize_season_value(opt.text) or normalize_season_value(opt.get_attribute('value'))
-                    if n and n not in nums:
-                        nums.append(n)
-                if nums:
-                    return nums
-        except Exception:
-            pass
-
-        # 2) Fallback: probe a reasonable range and keep the ones that actually select
-        found = []
-        for i in range(1, max_fallback + 1):
-            s = str(i)
-            try:
-                if select_season(driver, wait, s):
-                    if s not in found:
-                        found.append(s)
-            except Exception:
-                continue
-        return found
-
-    def _search_all_seasons():
-        """Search for the episode across every season available."""
-        seasons = _get_season_candidates()
-        if not seasons:
-            print_warning("Could not determine seasons to scan; scanning current view only")
-            tms = forward_walk()
-            return tms
-
-        print_step(f"Ignoring season filter: scanning {len(seasons)} seasons ({', '.join(seasons)})")
-        for s in seasons:
-            print_step(f"Scanning Season {s}...")
-            if not select_season(driver, wait, s):
-                print_warning(f"Could not select season {s}; skipping")
-                continue
-            _wait_for_first_page(driver, timeout=4.0)
-            tms = forward_walk()
-            if tms:
-                return tms
-        return None
-      
     try:
-        # If no specific season is provided, scan all seasons
-        if current_season is None:
-            result = _search_all_seasons()
-            if result:
-                return result, ""
-            print_warning("Episode not found after scanning all seasons")
-            return "", "Episode not found - manual verification needed"
-
         # First forward pass
         result = forward_walk()
         if result:
@@ -1791,28 +1723,32 @@ def process_episode(driver, wait, episode, index, total, state, allow_defer=True
         else:
             print_step("Seasons & Episodes tab already open - skipping")
   
-        ignore_season = bool(CONFIG.get('ignore_season_search'))
 
-        if ignore_season:
-            print_step("Ignore-season mode enabled: scanning entire series")
-            # Do not select a season; let the lookup scan all seasons
-            episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, None)
+
+
+  
+        # --- START OF MODIFICATION ---
+        # Determine if we should skip season selection
+
+        skip_season_selection = (not allow_defer) and CONFIG.get('ignore_season_on_second_pass', False)
+        if skip_season_selection:
+            print_step("Search All Seasons active: Scanning current view without switching seasons...")
         else:
-            # Select season only if it changed
+        # Ensure correct season is selected (Original Logic)
             if state.get('current_season') != season:
-                if not select_season(driver, wait, season):
-                    episode['Notes'] = f"Failed to select season {season}"
-                    return
-                state['current_season'] = season
-                time.sleep(1.0)
-            else:
-                print_step(f"Season {season} already selected - skipping")
-
-            episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, season)
-
+                print_step(f"Selecting season: {season}")
+                if select_season_mui(driver, wait, season):
+                    state['current_season'] = season
+                    time.sleep(1)
+        # --- END OF MODIFICATION ---
+        
+        print_step(f"Looking for episode: {episode_title}")
+        episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, season)
         episode['EpisodeTMSID'] = episode_tms_id
         if note:
             episode['Notes'] = note
+        
+        
 
     except Exception as e:
         print_error(f"Error processing episode: {e}")
@@ -1825,9 +1761,6 @@ def main():
 
     # Prompt for run mode at start
     prompt_mode_choice()
-    prompt_ignore_season_choice()
-
-    
     
     print(f"\n📂 Reading input CSV file: {CONFIG['input_csv']}...")
     try:
