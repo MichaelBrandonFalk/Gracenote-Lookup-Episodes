@@ -1475,10 +1475,45 @@ def _open_season_dropdown(driver, wait, timeout=4.0):
     except Exception:
         trigger = None
 
+    # 2) Fallback: any listbox trigger
     if trigger is None:
         try:
             cands = scope.find_elements(By.CSS_SELECTOR, "[aria-haspopup='listbox'], [role='combobox']")
             for el in cands:
+                try:
+                    if el.is_displayed():
+                        trigger = el
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            trigger = None
+
+    # 2b) Fallback: button-like element that contains the word 'Season' (older working approach)
+    if trigger is None:
+        try:
+            triggers = scope.find_elements(
+                By.XPATH,
+                ".//*[self::div or self::button or self::span][(contains(@role,'button') or @role='combobox' or contains(@class,'select') or contains(@class,'MuiSelect') or @aria-haspopup='listbox') and contains(normalize-space(.), 'Season')]"
+            )
+            for el in triggers:
+                try:
+                    if el.is_displayed():
+                        trigger = el
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            trigger = None
+
+    # 2c) Fallback: first select-like control near the Season and Episode Summary section
+    if trigger is None:
+        try:
+            triggers = scope.find_elements(
+                By.XPATH,
+                ".//*[self::div or self::button][@role='button' or @role='combobox' or contains(@class,'select') or contains(@class,'MuiSelect') or @aria-haspopup='listbox']"
+            )
+            for el in triggers:
                 try:
                     if el.is_displayed():
                         trigger = el
@@ -1517,7 +1552,10 @@ def _open_season_dropdown(driver, wait, timeout=4.0):
     return False
 
 def select_season(driver, wait, season_number):
-    desired = normalize_season_value(season_number) or '1'
+    raw = str(season_number or '').strip()
+    desired_num = normalize_season_value(raw)
+    want_no_season = (not desired_num) and (raw == '' or 'no season' in raw.lower() or raw == '0')
+    desired = desired_num or ('0' if want_no_season else '1')
     print_step(f"Selecting Season {desired}...")
     # 1) Try native <select>
     try:
@@ -1528,7 +1566,7 @@ def select_season(driver, wait, season_number):
             sel = Select(dropdown)
             # Try visible text variations first
             tried = False
-            for text in (f"Season {desired}", f"S{desired}", desired):
+            for text in (("No Season",) if desired == '0' else (f"Season {desired}", f"S{desired}", desired)):
                 try:
                     sel.select_by_visible_text(text)
                     tried = True
@@ -1574,7 +1612,7 @@ def select_season(driver, wait, season_number):
                 continue
 
         best = None
-        want = f"Season {desired}"
+        want = ("No Season" if desired == '0' else f"Season {desired}")
         for el in visible:
             try:
                 txt = (el.text or '').strip()
@@ -1627,7 +1665,11 @@ def get_available_seasons(driver):
         if dropdowns:
             sel = Select(dropdowns[0])
             for opt in sel.options:
-                v = normalize_season_value(opt.text) or normalize_season_value(opt.get_attribute('value'))
+                txt = (opt.text or '').strip()
+                if txt.lower() == 'no season':
+                    seasons.add('0')
+                    continue
+                v = normalize_season_value(txt) or normalize_season_value(opt.get_attribute('value'))
                 if v:
                     seasons.add(v)
     except Exception:
@@ -1651,6 +1693,9 @@ def get_available_seasons(driver):
                         if not el.is_displayed():
                             continue
                         txt = (el.text or '').strip()
+                        if txt.lower() == 'no season':
+                            seasons.add('0')
+                            continue
                         m = re.match(r'^Season\s+(\d+)$', txt)
                         if m:
                             seasons.add(m.group(1))
@@ -1673,11 +1718,15 @@ def get_available_seasons(driver):
         except Exception:
             pass
 
-    # Sort numerically
+    # Sort numerically, but keep '0' ("No Season") first if present
     try:
         return [str(x) for x in sorted({int(s) for s in seasons})]
     except Exception:
-        return sorted(list(seasons))
+        # Fallback: keep '0' first if present
+        out = sorted([s for s in seasons if s != '0'])
+        if '0' in seasons:
+            out = ['0'] + out
+        return out
 
 
 def find_episode_across_all_seasons(driver, wait, episode_title):
