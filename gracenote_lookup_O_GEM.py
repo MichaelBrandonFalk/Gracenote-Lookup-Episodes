@@ -1394,6 +1394,93 @@ def _read_current_season_value(driver):
 
     return ''
 
+
+# --- Helper: open the season dropdown (Material UI or similar) ---
+def _open_season_dropdown(driver, wait, timeout=4.0):
+    """Open the Season dropdown on the Seasons & Episodes tab and return True if the menu appears."""
+    # If the menu is already open, do not click again (clicking would close it)
+    try:
+        opts_now = driver.find_elements(By.XPATH,
+            "//*[@role='listbox']//*[self::li or self::div][starts-with(normalize-space(.), 'Season ') or normalize-space(.)='No Season'] | "
+            "//ul[contains(@class,'MuiMenu-list')]//li[starts-with(normalize-space(.), 'Season ') or normalize-space(.)='No Season'] | "
+            "//li[contains(@class,'MuiMenuItem')][starts-with(normalize-space(.), 'Season ') or normalize-space(.)='No Season']")
+        for o in opts_now:
+            try:
+                if o.is_displayed():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    trigger = None
+
+    # Prefer the season selector near the "Season and Episode Summary" header
+    trigger_xpaths = [
+        "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[@aria-haspopup='listbox'][1]",
+        "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[@role='combobox'][1]",
+        "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[contains(@class,'MuiSelect-select')][1]",
+        # Fallback: any visible listbox trigger
+        "//*[@aria-haspopup='listbox']",
+        "//*[@role='combobox']",
+        "//*[contains(@class,'MuiSelect-select')]",
+    ]
+
+    for xp in trigger_xpaths:
+        try:
+            els = driver.find_elements(By.XPATH, xp)
+        except Exception:
+            els = []
+        for el in els:
+            try:
+                if el and el.is_displayed():
+                    trigger = el
+                    break
+            except Exception:
+                continue
+        if trigger:
+            break
+
+    # CSS fallback
+    if not trigger:
+        try:
+            cands = driver.find_elements(By.CSS_SELECTOR, "[aria-haspopup='listbox'], [role='combobox'], .MuiSelect-select")
+            for el in cands:
+                try:
+                    if el.is_displayed():
+                        trigger = el
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            trigger = None
+
+    if not trigger:
+        return False
+
+    # Click and wait for the menu to appear
+    if not _click_el(driver, trigger):
+        return False
+
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            opts = driver.find_elements(By.XPATH,
+                "//*[@role='listbox']//*[self::li or self::div][starts-with(normalize-space(.), 'Season ') or normalize-space(.)='No Season'] | "
+                "//ul[contains(@class,'MuiMenu-list')]//li[starts-with(normalize-space(.), 'Season ') or normalize-space(.)='No Season'] | "
+                "//li[contains(@class,'MuiMenuItem')][starts-with(normalize-space(.), 'Season ') or normalize-space(.)='No Season']")
+            for o in opts:
+                try:
+                    if o.is_displayed():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    return False
+
 def select_season(driver, wait, season_number):
     desired = normalize_season_value(season_number) or '1'
     print_step(f"Selecting Season {desired}...")
@@ -1435,75 +1522,57 @@ def select_season(driver, wait, season_number):
 
     # 2) Try custom dropdowns (Material UI or similar)
     try:
-        # Preferred: click the visible "Season X" control near the Season and Episode Summary header
-        trigger = None
-        try:
-            trigger = driver.find_element(
-                By.XPATH,
-                "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[(self::div or self::button or self::span) and contains(normalize-space(.), 'Season ')][1]"
-            )
-        except Exception:
-            trigger = None
+        if not _open_season_dropdown(driver, wait, timeout=4.0):
+            raise Exception("Season dropdown did not open")
 
-        # Fallback: common MUI select triggers
-        if trigger is None:
-            candidates = driver.find_elements(
-                By.CSS_SELECTOR,
-                ".MuiSelect-select, .MuiInputBase-root [aria-haspopup='listbox'], [role='combobox'], [aria-haspopup='listbox']"
-            )
-            for el in candidates:
-                try:
-                    if el.is_displayed():
-                        trigger = el
-                        break
-                except Exception:
-                    continue
+        options = driver.find_elements(
+            By.XPATH,
+            "//*[@role='listbox']//*[@role='option'] | //*[@role='listbox']//li | //ul[contains(@class,'MuiMenu-list')]//li | //li[contains(@class,'MuiMenuItem')]"
+        )
 
-        if trigger:
-            _click_el(driver, trigger)
-            time.sleep(0.3)
+        visible = []
+        for el in options:
+            try:
+                if el.is_displayed():
+                    visible.append(el)
+            except Exception:
+                continue
 
-            # Options in the popover list
-            options = driver.find_elements(
-                By.XPATH,
-                "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]"
-            )
+        best = None
+        want = f"Season {desired}"
+        for el in visible:
+            try:
+                txt = (el.text or '').strip()
+                if txt == want:
+                    best = el
+                    break
+            except Exception:
+                continue
 
-            # If listbox roles are missing, fall back to any visible items that include 'Season'
-            if not options:
-                options = driver.find_elements(By.XPATH, "//*[self::li or self::div or self::button][contains(normalize-space(.), 'Season ')]")
-
-            # Pick the option whose normalized season matches the desired value
-            best = None
-            for el in options:
+        # Secondary fallback: allow exact numeric-only option text
+        if best is None:
+            for el in visible:
                 try:
                     txt = (el.text or '').strip()
-                    if normalize_season_value(txt) == desired:
+                    if txt == desired:
                         best = el
                         break
                 except Exception:
                     continue
 
-            # Fallback: match exact text variations
-            if best is None:
-                for want in (f"Season {desired}", f"S{desired}", desired):
-                    for el in options:
-                        try:
-                            if (el.text or '').strip() == want:
-                                best = el
-                                break
-                        except Exception:
-                            continue
-                    if best is not None:
-                        break
+        if best and _click_el(driver, best):
+            time.sleep(1.2)
+            cur = _read_current_season_value(driver)
+            if cur and cur != desired:
+                print_warning(f"Season picker readback '{cur}' did not match desired '{desired}'")
+            print_success(f"Season {desired} selected")
+            return True
 
-            if best and _click_el(driver, best):
-                time.sleep(1.2)
-                cur = _read_current_season_value(driver)
-                if cur and cur != desired:
-                    print_warning(f"Season picker readback '{cur}' did not match desired '{desired}'")
-                print_success(f"Season {desired} selected")
-                return True
+        try:
+            driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
     except Exception as e:
         print_warning(f"Custom dropdown path failed: {e}")
 
@@ -1532,64 +1601,31 @@ def get_available_seasons(driver):
     # 2) Material UI style dropdown options (open and read listbox)
     if not seasons:
         try:
-            anchor = None
-            try:
-                anchor = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Season and Episode Summary')]")
-            except Exception:
-                anchor = None
-
-            scopes = [anchor, driver] if anchor is not None else [driver]
-
-            trigger = None
-            for scope in scopes:
-                try:
-                    cands = scope.find_elements(By.CSS_SELECTOR, ".MuiSelect-select, .MuiInputBase-root [aria-haspopup='listbox'], [role='combobox'], [aria-haspopup='listbox']")
-                except Exception:
-                    cands = []
-                for el in cands:
+            if _open_season_dropdown(driver, WebDriverWait(driver, 4), timeout=4.0):
+                options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //*[@role='listbox']//li | //ul[contains(@class,'MuiMenu-list')]//li | //li[contains(@class,'MuiMenuItem')]")
+                for el in options:
                     try:
-                        if el.is_displayed():
-                            trigger = el
-                            break
+                        if not el.is_displayed():
+                            continue
+                        txt = (el.text or '').strip()
+                        m = re.match(r'^Season\s+(\d+)$', txt)
+                        if m:
+                            seasons.add(m.group(1))
                     except Exception:
                         continue
-                if trigger:
-                    break
 
-            if trigger:
-                _click_el(driver, trigger)
-                time.sleep(0.3)
-                options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
-                for el in options:
-                    txt = (el.text or '').strip()
-                    v = normalize_season_value(txt)
-                    if v:
-                        seasons.add(v)
-                # Close menu (ESC)
                 try:
                     driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
                 except Exception:
                     pass
-        except Exception:
-            pass
 
-    # 3) Brute-force fallback: attempt selecting seasons 1..30 and record those that "stick"
-    if not seasons:
-        try:
-            for i in range(1, 31):
-                desired = str(i)
-                before = _read_current_season_value(driver)
-                if select_season(driver, WebDriverWait(driver, 2), desired):
-                    after = _read_current_season_value(driver)
-                    # If we can read it back and it matches, count it
-                    if after and after == desired:
-                        seasons.add(desired)
-                    # If we can't read it back, still add when selection call succeeded
-                    elif not after:
-                        seasons.add(desired)
-                    # If it didn't change (readback mismatch), don't add
-                # Small delay to avoid hammering the UI
-                time.sleep(0.15)
+                if seasons:
+                    try:
+                        ordered = [str(x) for x in sorted({int(s) for s in seasons})]
+                    except Exception:
+                        ordered = sorted(list(seasons))
+                    print_step(f"Available seasons detected: {', '.join(ordered)}")
+                    print_step(f"Season count: {len(ordered)}")
         except Exception:
             pass
 

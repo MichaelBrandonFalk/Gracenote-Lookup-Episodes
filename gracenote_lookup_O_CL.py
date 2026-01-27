@@ -29,42 +29,32 @@ CONFIG = {
     'wait_timeout': 10,
     'delay_between_episodes': 2,
     'second_pass_only': False,
-    'ignore_season_filter': False  # NEW: When True, searches across all seasons
+    'ignore_season_on_second_pass': False  # <--- Add this line
 }
 
 
 def prompt_mode_choice():
-    """
-    Ask the user which mode to run: normal two-pass, second pass only, or ignore season filter.
-    Sets CONFIG['second_pass_only'] and CONFIG['ignore_season_filter'] based on the answer.
-    """
     try:
         print("\nRun mode:")
         print("  1) Normal two-pass workflow")
         print("  2) Second pass only (skip first pass)")
         choice = input("Choose 1 or 2 [1]: ").strip()
-        if choice == '2':
-            CONFIG['second_pass_only'] = True
-            print_success("Second pass only mode enabled")
-        else:
-            CONFIG['second_pass_only'] = False
-            print_success("Normal mode selected")
+        CONFIG['second_pass_only'] = (choice == '2')
         
-        # NEW: Ask about season filtering
-        print("\nSeason filtering:")
-        print("  1) Use season filter (default - faster)")
-        print("  2) Ignore season filter (search entire series - slower but more thorough)")
-        season_choice = input("Choose 1 or 2 [1]: ").strip()
-        if season_choice == '2':
-            CONFIG['ignore_season_filter'] = True
-            print_success("Season filter disabled - will search entire series for each episode")
+        # Add the new toggle prompt here
+        print("\nSeason handling for second pass:")
+        print("  1) Search specific season from CSV")
+        print("  2) Ignore season number (search entire series)")
+        s_choice = input("Choose 1 or 2 [1]: ").strip()
+        if s_choice == '2':
+            CONFIG['ignore_season_on_second_pass'] = True
+            print_success("Ignore Season enabled for second pass")
         else:
-            CONFIG['ignore_season_filter'] = False
-            print_success("Season filter enabled - will search within specific seasons")
+            CONFIG['ignore_season_on_second_pass'] = False
+            print_success("Specific season matching enabled")
             
     except Exception:
-        # Fallback to default if input fails
-        print_warning("Could not read input. Using default mode")
+        print_warning("Could not read input. Using default settings.")
 
 # ---------------------------------------------------------------------------
 # No persistence across runs
@@ -203,35 +193,42 @@ def canonicalize_title_for_match(s):
     Normalizes titles so that 'Spanish Grant, The' and 'The Spanish Grant' match.
     - Moves trailing ', The|, A|, An' to the front
     - Collapses whitespace
-    - Removes non-word characters
-    - Lowercases
+    - Lowercases and removes punctuation via normalize_text
     """
     if not s:
-        return ""
-    s = s.strip()
-    # Handle pattern: "Title, The" -> "The Title"
-    m = re.match(r'^(.*),\s*(The|A|An)\s*$', s, flags=re.IGNORECASE)
+        return ''
+    t = str(s).strip()
+    m = re.match(r'^(.*?),(?:\s*)(the|a|an)$', t, flags=re.IGNORECASE)
     if m:
-        s = f"{m.group(2)} {m.group(1)}"
-    # Normalize: remove non-word chars, collapse spaces, lowercase
-    s = re.sub(r'\W+', ' ', s).strip().lower()
-    return s
+        t = f"{m.group(2)} {m.group(1)}"
+    # Collapse multiple spaces
+    t = re.sub(r'\s+', ' ', t)
+    # Use existing normalize_text to strip punctuation and lowercase
+    return normalize_text(t)
+
+# --- Keys and existing-output merge helpers ---
 
 def episode_key(series_title, episode_title, season):
     """
-    Build a unique key for an episode based on normalized series, episode title, and numeric season.
+    Build a stable key for an episode using normalized series title,
+    canonicalized episode title, and normalized season.
     """
-    return (normalize_text(series_title), canonicalize_title_for_match(episode_title), normalize_season_value(season))
+    s = normalize_text(series_title or '')
+    e = canonicalize_title_for_match(episode_title or '')
+    n = normalize_season_value(season) or '1'
+    return f"{s}|{e}|{n}"
+
 
 def load_existing_output_maps(output_csv):
     """
-    Build a map of existing episodes in the output CSV by (normalized_series, canonical_episode, season) key,
-    as well as a map of series titles to their SH IDs. Also count how many rows are marked with '1' sentinel vs
-    real EP/SH IDs for statistics.
-    Returns: (existing_ep_map, existing_series_map, stats)
+    Load the existing output CSV, if present, and return two maps:
+      1) episodes_map: key -> {EpisodeTMSID, SeriesTMSID} for rows that should be skipped
+      2) series_map: normalized series title -> SH id for rows that have an SH id
+    
+    Returns (episodes_map, series_map, stats) where stats contains skip counts
     """
-    existing_ep_map = {}
-    existing_series_map = {}
+    episodes_map = {}
+    series_map = {}
     stats = {
         'rows_with_1_in_episode': 0,
         'rows_with_1_in_series': 0,
@@ -239,341 +236,1272 @@ def load_existing_output_maps(output_csv):
         'rows_with_real_sh_id': 0,
         'total_skip_rows': 0
     }
-    if not os.path.exists(output_csv):
-        return existing_ep_map, existing_series_map, stats
+    
     try:
+        if not os.path.exists(output_csv):
+            return episodes_map, series_map, stats
         with open(output_csv, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # Read episode identifiers
-                series_val = _get_first(row, ['SeriesTitle', 'Series Title', 'Series', 'Show', 'series_title'])
-                ep_val = _get_first(row, ['EpisodeTitle', 'Episode Title', 'Title', 'Episode', 'episode_title'])
-                season_val = _get_first(row, ['Season', 'season']) or '1'
-                # Read TMS IDs
-                ep_tms = _get_first(row, ['EpisodeTMSID', 'Episode TMS ID', 'Episode_TMS_ID'])
-                series_tms = _get_first(row, ['SeriesTMSID', 'Series TMS ID', 'Series_TMS_ID'])
-                # Count statistics
-                if _value_is_one(ep_tms):
-                    stats['rows_with_1_in_episode'] += 1
-                if _value_is_one(series_tms):
-                    stats['rows_with_1_in_series'] += 1
-                if re.search(r'EP\d+', ep_tms or '', flags=re.IGNORECASE):
+                ep_id = (row.get('EpisodeTMSID') or row.get('Episode TMS ID') or row.get('Episode_TMS_ID') or '').strip()
+                sh_id = (row.get('SeriesTMSID') or row.get('Series TMS ID') or row.get('Series_TMS_ID') or '').strip()
+                s_title = (row.get('SeriesTitle') or row.get('Series') or row.get('series_title') or row.get('Show') or '').strip()
+                e_title = (row.get('EpisodeTitle') or row.get('Title') or row.get('episode_title') or row.get('Episode') or '').strip()
+                season = (row.get('Season') or row.get('season') or '1')
+                key = episode_key(s_title, e_title, season)
+                
+                # Track what we find
+                has_real_ep = bool(re.search(r'EP\d+', ep_id, flags=re.IGNORECASE))
+                has_real_sh = bool(re.search(r'SH\d+', sh_id, flags=re.IGNORECASE))
+                has_1_in_ep = bool(ep_id and re.fullmatch(r'0*1(\.0+)?', ep_id))
+                has_1_in_sh = bool(sh_id and re.fullmatch(r'0*1(\.0+)?', sh_id))
+                
+                if has_real_ep:
                     stats['rows_with_real_ep_id'] += 1
-                if re.search(r'SH\d+', series_tms or '', flags=re.IGNORECASE):
+                if has_real_sh:
                     stats['rows_with_real_sh_id'] += 1
-                # Build the episode map
-                key = episode_key(series_val, ep_val, season_val)
-                if ep_tms or series_tms:
-                    existing_ep_map[key] = {
-                        'EpisodeTMSID': ep_tms,
-                        'SeriesTMSID': series_tms
-                    }
-                    # Count if this row is marked to skip (either has EP id or is sentinel 1)
-                    if _value_means_done(ep_tms) or _value_is_one(series_tms):
-                        stats['total_skip_rows'] += 1
-                # Build series map (title -> SH id)
-                if series_val and series_tms and re.search(r'SH\d+', series_tms or '', flags=re.IGNORECASE):
-                    norm_title = normalize_text(series_val)
-                    existing_series_map[norm_title] = series_tms
+                if has_1_in_ep:
+                    stats['rows_with_1_in_episode'] += 1
+                if has_1_in_sh:
+                    stats['rows_with_1_in_series'] += 1
+                
+                # Add to map if it has real EP ID or sentinel "1" in EP, or sentinel "1" in SH
+                if (_value_means_done(ep_id) or _value_is_one(sh_id)):
+                    episodes_map[key] = {'EpisodeTMSID': ep_id, 'SeriesTMSID': sh_id}
+                    stats['total_skip_rows'] += 1
+                
+                # Only seed series cache when we have a real SH id
+                if has_real_sh:
+                    series_map[normalize_text(s_title)] = sh_id
+    except Exception as e:
+        print_warning(f"Error loading output CSV: {e}")
+    
+    return episodes_map, series_map, stats
+
+# --- Title extraction and series label helpers ---
+def extract_clean_title(text):
+    """
+    Pull the visible title line and drop a trailing year like '(2016)'.
+    Used to compare titles in autocomplete and search results.
+    """
+    if not text:
+        return ''
+    t = str(text).strip().splitlines()[0]
+    # Remove a trailing year in parentheses
+    t = re.sub(r'\(\d{4}\)$', '', t).strip()
+    return t
+
+def has_series_label(text):
+    """
+    Best-effort check that an option or result is a SERIES (not a film or special).
+    """
+    return 'series' in (text or '').lower()
+
+# --- Pagination helpers ---
+def _scroll_into_view(driver, el):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
     except Exception:
         pass
-    return existing_ep_map, existing_series_map, stats
+
+def _find_pager_buttons(driver):
+    """
+    Try to locate Previous and Next pager controls in or near the Season & Episode table.
+    Returns a tuple (prev_button, next_button) which may contain None if not found.
+    """
+    prev_btn, next_btn = None, None
+
+    # 1) Prefer controls located near the "x - y of z" label
+    container = None
+    marker_el = _get_range_marker_el(driver)
+    if marker_el:
+        try:
+            container = marker_el.find_element(By.XPATH, "./ancestor::*[self::div or self::nav or self::footer or self::section][1]")
+        except Exception:
+            container = None
+
+    def pick_buttons(scope):
+        _prev, _next = None, None
+        if scope is None:
+            scope = driver
+        # Broad query: include buttons, elements with role=button, and common MUI icon buttons
+        candidates = scope.find_elements(By.XPATH,
+            ".//button | .//*[@role='button'] | .//div[contains(@class,'MuiIconButton')] | .//span[contains(@class,'MuiIconButton')]")
+        for b in candidates:
+            label = (b.get_attribute('aria-label') or b.get_attribute('title') or b.text or '').strip().lower()
+            classes = (b.get_attribute('class') or '').lower()
+
+            # Expanded token sets for better robustness
+            prev_label_tokens = ['previous', 'prev', 'go to previous page', 'first page', 'back']
+            next_label_tokens = ['next', 'go to next page', 'last page', 'forward']
+            prev_class_tokens = ['chevron_left', 'keyboard_arrow_left', 'keyboardarrowleft', 'navigate_before', 'arrow_back', 'first_page']
+            next_class_tokens = ['chevron_right', 'keyboard_arrow_right', 'keyboardarrowright', 'navigate_next', 'arrow_forward', 'last_page']
+            prev_symbols = {'‹', '<', '«', '⟨'}
+            next_symbols = {'›', '>', '»', '⟩'}
+
+            if any(tok in label for tok in prev_label_tokens) or any(tok in classes for tok in prev_class_tokens) or label in prev_symbols:
+                _prev = _prev or b
+            if any(tok in label for tok in next_label_tokens) or any(tok in classes for tok in next_class_tokens) or label in next_symbols:
+                _next = _next or b
+        return _prev, _next
+
+    prev_btn, next_btn = pick_buttons(container)
+    if not prev_btn and not next_btn:
+        prev_btn, next_btn = pick_buttons(None)
+
+    # Last-chance fallback: look for two icon buttons immediately following the marker
+    if (not prev_btn or not next_btn) and marker_el:
+        try:
+            sibs = marker_el.find_elements(By.XPATH, "following::*[self::button or @role='button'][position()<=5]")
+            if sibs:
+                if len(sibs) >= 2:
+                    prev_btn = prev_btn or sibs[0]
+                    next_btn = next_btn or sibs[1]
+                else:
+                    next_btn = next_btn or sibs[0]
+        except Exception:
+            pass
+
+    return prev_btn, next_btn
+
+def _is_enabled(btn):
+    if btn is None:
+        return False
+    try:
+        disabled_attr = btn.get_attribute('disabled')
+        aria_disabled = btn.get_attribute('aria-disabled')
+        classes = (btn.get_attribute('class') or '').lower()
+        return not (disabled_attr is not None or (aria_disabled and aria_disabled.lower() == 'true') or ('disabled' in classes) or ('mui-disabled' in classes))
+    except Exception:
+        return True
+
+def _get_range_marker(driver):
+    """
+    Return the exact pager label like '1 - 20 of 30' if present, else ''.
+    Clamps the upper bound to the reported total to avoid accidental cross-node matches.
+    """
+    try:
+        el = _get_range_marker_el(driver)
+        if not el:
+            return ''
+        txt = (el.text or '').strip()
+        m = re.search(r"(\d+)\s*-\s*(\d+)\s*of\s*(\d+)", txt)
+        if not m:
+            return ''
+        lo = int(m.group(1))
+        hi = int(m.group(2))
+        total = int(m.group(3))
+        if hi > total:
+            hi = total
+        if lo > hi:
+            lo, hi = hi, lo
+        return f"{lo} - {hi} of {total}"
+    except Exception:
+        return ''
+
+# --- Helper: return the DOM element for the range marker ---
+def _get_range_marker_el(driver):
+    """
+    Return the DOM element that contains a label like '1 - 20 of 35', else None.
+    """
+    try:
+        candidates = driver.find_elements(By.XPATH, "//*[self::div or self::span or self::p][contains(normalize-space(.),' of ') and contains(normalize-space(.),'-')]")
+        for el in candidates:
+            txt = (el.text or '').strip()
+            if re.search(r'\d+\s*-\s*\d+\s*of\s*\d+', txt):
+                return el
+    except Exception:
+        pass
+    return None
+
+# --- Helpers to anchor to the TablePagination widget ---
+
+def _get_pagination_root(driver):
+    """Return the nearest TablePagination root element using the marker as an anchor."""
+    marker = _get_range_marker_el(driver)
+    if not marker:
+        return None
+    node = marker
+    for _ in range(6):
+        try:
+            if node.find_elements(By.CSS_SELECTOR, ".MuiTablePagination-actions, [class*='TablePagination-actions']"):
+                return node
+        except Exception:
+            pass
+        try:
+            node = node.find_element(By.XPATH, "..")
+        except Exception:
+            break
+    return marker
+
+
+def _get_actions_container(driver):
+    """Return the TablePagination actions container if available, else the pagination root."""
+    root = _get_pagination_root(driver)
+    if not root:
+        return None
+    try:
+        return root.find_element(By.CSS_SELECTOR, ".MuiTablePagination-actions, [class*='TablePagination-actions']")
+    except Exception:
+        return root
+
+# --- Generic click helpers and pager fallbacks ---
+
+# --- Helpers: wait for pager state change and history reflow ---
+
+def _wait_for_marker_change(driver, before_text, timeout=3.0):
+    """Wait until the pager label changes or the marker element is re-rendered."""
+    try:
+        before_el = _get_range_marker_el(driver)
+    except Exception:
+        before_el = None
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: (
+                (before_el is not None and EC.staleness_of(before_el)(d)) or
+                (_get_range_marker(d) and _get_range_marker(d) != before_text)
+            )
+        )
+        return True
+    except Exception:
+        return False
+
+def _reflow_via_history(driver):
+    """For single page apps, a quick back/forward can force a repaint of widgets."""
+    try:
+        driver.back()
+        time.sleep(1.0)
+    except Exception:
+        pass
+    try:
+        driver.forward()
+        time.sleep(1.2)
+    except Exception:
+        pass
+
+def _click_el(driver, el):
+    try:
+        _scroll_into_view(driver, el)
+        el.click()
+        return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception:
+            try:
+                el.send_keys(Keys.SPACE)
+                return True
+            except Exception:
+                return False
+
+def _find_clickables_near_marker(driver):
+    """
+    Return likely pager controls that appear near the range marker 'x - y of z'.
+    Searches only inside the nearest pager container and the marker itself
+    (avoids picking global footer/help widgets).
+    """
+    marker_el = _get_range_marker_el(driver)
+    candidates = []
+    scopes = []
+
+    if marker_el:
+        # Nearest visual container that likely holds the pager
+        try:
+            container = marker_el.find_element(By.XPATH, "./ancestor::*[self::div or self::nav or self::footer or self::section][1]")
+            scopes.append(container)
+        except Exception:
+            pass
+        # The marker itself for neighbor-based queries **inside** this local scope only
+        scopes.append(marker_el)
+    else:
+        # Fall back to the whole page (rare)
+        scopes.append(driver)
+
+    for scope in scopes:
+        try:
+            part = scope.find_elements(By.XPATH,
+                ".//button | .//*[@role='button'] | .//*[contains(@class,'IconButton')] | .//*[contains(@class,'Pagination')]")
+            candidates.extend(part)
+        except Exception:
+            pass
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for el in candidates:
+        try:
+            key = el.id
+        except Exception:
+            key = id(el)
+        if key not in seen:
+            seen.add(key)
+            unique.append(el)
+
+    # Only visible items
+    filtered = []
+    for el in unique:
+        try:
+            if el.is_displayed():
+                filtered.append(el)
+        except Exception:
+            continue
+
+    return filtered
+
+def _pick_rightmost_clickable(cands):
+    best, best_x = None, -1
+    for el in cands:
+        try:
+            if not el.is_displayed():
+                continue
+            x = el.location.get('x', 0)
+            if x > best_x:
+                best = el
+                best_x = x
+        except Exception:
+            continue
+    return best
+
+def _pick_leftmost_clickable(cands):
+    best, best_x = None, 10**9
+    for el in cands:
+        try:
+            if not el.is_displayed():
+                continue
+            x = el.location.get('x', 0)
+            if x < best_x:
+                best = el
+                best_x = x
+        except Exception:
+            continue
+    return best
+
+
+# --- Pager helpers for direction-aware button selection ---
+def _label_and_classes(el):
+    label = (el.get_attribute('aria-label') or el.get_attribute('title') or el.text or '').strip().lower()
+    classes = (el.get_attribute('class') or '').lower()
+    return label, classes
+
+# --- Helper: filter out help/feedback widgets ---
+def _is_help_like(el):
+    """Heuristic: identify help/feedback widgets so we never click them."""
+    try:
+        label, classes = _label_and_classes(el)
+        text = (el.text or '').strip().lower()
+        hay = f"{label} {text} {classes}"
+        bad = ['help', 'get help', 'user guide', "what's new", 'zendesk', 'issue status', 'send feedback', 'get started']
+        return any(tok in hay for tok in bad)
+    except Exception:
+        return False
+
+def _choose_dir_button(cands, want_next=True):
+    # First pass: look for explicit labels or arrow classes
+    for el in cands:
+        try:
+            label, classes = _label_and_classes(el)
+            if want_next:
+                if (any(tok in label for tok in ['next', 'go to next page', 'last page', 'forward']) or
+                    any(tok in classes for tok in ['chevron_right', 'keyboard_arrow_right', 'keyboardarrowright', 'navigate_next', 'arrow_forward', 'last_page']) or
+                    label in {'›', '>', '»', '⟩'}):
+                    return el
+            else:
+                if (any(tok in label for tok in ['previous', 'prev', 'go to previous page', 'first page', 'back']) or
+                    any(tok in classes for tok in ['chevron_left', 'keyboard_arrow_left', 'keyboardarrowleft', 'navigate_before', 'arrow_back', 'first_page']) or
+                    label in {'‹', '<', '«', '⟨'}):
+                    return el
+        except Exception:
+            continue
+    # Second pass: geometry fallback
+    return _pick_rightmost_clickable(cands) if want_next else _pick_leftmost_clickable(cands)
+
+def _click_next_page(driver):
+    prev_btn, next_btn = _find_pager_buttons(driver)
+    marker_before = _get_range_marker(driver)
+    # Try explicit next button first
+    if next_btn and _is_enabled(next_btn):
+        if _click_el(driver, next_btn):
+            if _wait_for_marker_change(driver, marker_before, timeout=2.5):
+                return True
+    # Fallback using candidates near the marker
+    cands = _find_clickables_near_marker(driver)
+    btn = _choose_dir_button(cands, want_next=True)
+    if btn and _click_el(driver, btn):
+        if _wait_for_marker_change(driver, marker_before, timeout=2.5):
+            return True
+    # Recovery: force a UI reflow, then retry once with explicit aria-label in the pager scope
+    _reflow_via_history(driver)
+    marker_before = _get_range_marker(driver)
+    # Try again in local scope
+    prev_btn2, next_btn2 = _find_pager_buttons(driver)
+    if next_btn2 and _is_enabled(next_btn2) and _click_el(driver, next_btn2):
+        if _wait_for_marker_change(driver, marker_before, timeout=2.5):
+            return True
+    # Last resort
+    return False
+
+def _click_prev_page(driver):
+    prev_btn, next_btn = _find_pager_buttons(driver)
+    marker_before = _get_range_marker(driver)
+
+    # Try explicit prev button first
+    if prev_btn and _is_enabled(prev_btn):
+        if _click_el(driver, prev_btn):
+            if _wait_for_marker_change(driver, marker_before, timeout=2.5):
+                return True
+
+    # Fallback using candidates near the marker
+    cands = _find_clickables_near_marker(driver)
+
+    # If we can see a Next button, choose the clickable immediately to its left, same row, not help-like
+    btn = None
+    try:
+        if next_btn and cands:
+            next_x = next_btn.location.get('x', 0)
+            try:
+                nr = next_btn.rect
+                next_mid_y = (nr.get('y', 0) + nr.get('height', 0) / 2.0)
+            except Exception:
+                next_mid_y = None
+            left_of_next = []
+            for el in cands:
+                try:
+                    if _is_help_like(el):
+                        continue
+                    x = el.location.get('x', 0)
+                    if x < next_x:
+                        if next_mid_y is None:
+                            left_of_next.append(el)
+                        else:
+                            r = el.rect
+                            mid_y = r.get('y', 0) + r.get('height', 0) / 2.0
+                            if abs(mid_y - next_mid_y) <= 30:
+                                left_of_next.append(el)
+                except Exception:
+                    continue
+            if left_of_next:
+                chosen = _choose_dir_button(left_of_next, want_next=False)
+                if chosen is None or chosen not in left_of_next:
+                    chosen = _pick_rightmost_clickable(left_of_next)
+                btn = chosen
+    except Exception:
+        btn = None
+
+    if not btn:
+        btn = _choose_dir_button(cands, want_next=False)
+
+    if btn and _click_el(driver, btn):
+        if _wait_for_marker_change(driver, marker_before, timeout=2.5):
+            return True
+
+    # Try a targeted fallback: click the "first page" control if present
+    actions = _get_actions_container(driver)
+    if actions:
+        try:
+            first_btn = None
+            try:
+                first_btn = actions.find_element(By.XPATH, ".//button[@aria-label='Go to first page']")
+            except Exception:
+                # Class-name based fallback
+                cands = actions.find_elements(By.XPATH, ".//button | .//*[@role='button']")
+                for b in cands:
+                    cls = (b.get_attribute('class') or '').lower()
+                    title = (b.get_attribute('title') or '').strip().lower()
+                    if 'first_page' in cls or title == 'first page':
+                        first_btn = b
+                        break
+            if first_btn and _is_enabled(first_btn) and _click_el(driver, first_btn):
+                if _wait_for_marker_change(driver, marker_before, timeout=2.5):
+                    return True
+        except Exception:
+            pass
+
+    # Recovery: force a UI reflow, then retry once with explicit aria-label in the pager scope
+    _reflow_via_history(driver)
+    marker_before = _get_range_marker(driver)
+    prev_btn2, next_btn2 = _find_pager_buttons(driver)
+    if prev_btn2 and _is_enabled(prev_btn2) and _click_el(driver, prev_btn2):
+        if _wait_for_marker_change(driver, marker_before, timeout=2.5):
+            return True
+
+    return False
+
+def robust_clear_and_type(element, text, driver):
+    """
+    Aggressively clear a text field and type `text`.
+    Works across Mac and Windows keyboard shortcuts and falls back to JS.
+    """
+    try:
+        element.click()
+    except Exception:
+        pass
+    # Try JS clear first
+    try:
+        driver.execute_script("arguments[0].value = '';", element)
+    except Exception:
+        pass
+    time.sleep(0.05)
+    # Try common select-all and delete sequences
+    try:
+        element.send_keys(Keys.COMMAND + "a")
+        element.send_keys(Keys.DELETE)
+    except Exception:
+        pass
+    try:
+        element.send_keys(Keys.CONTROL + "a")
+        element.send_keys(Keys.DELETE)
+    except Exception:
+        pass
+    try:
+        element.clear()
+    except Exception:
+        pass
+    time.sleep(0.05)
+    element.send_keys(text)
+
+# --- New helper: try_select_autocomplete_series
+def try_select_autocomplete_series(driver, wait, series_title):
+    """
+    Try to select a series from the autocomplete dropdown suggestions.
+    If there are multiple exact-title matches, only auto-click when exactly one looks SERIES-like.
+    SERIES-like is detected by either:
+      - explicit 'series' label in option text, OR
+      - presence of an SH id in option text/HTML.
+    """
+    try:
+        # Wait for the popper or listbox to appear
+        wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "ul[role='listbox'], div[role='listbox'], .MuiAutocomplete-popper [role='listbox']")) > 0)
+        containers = driver.find_elements(By.CSS_SELECTOR, "ul[role='listbox'], div[role='listbox'], .MuiAutocomplete-popper [role='listbox']")
+        if not containers:
+            return False
+        container = containers[0]
+
+        def collect_options():
+            opts = driver.find_elements(By.CSS_SELECTOR, "[role='option'], ul[role='listbox'] li, div[role='listbox'] li, [data-option-index]")
+            if not opts:
+                opts = driver.find_elements(By.XPATH, "//div[contains(@class,'Autocomplete') or contains(@class,'popper') or @role='listbox']//li")
+            out = []
+            for o in opts:
+                try:
+                    if o.is_displayed():
+                        out.append(o)
+                except Exception:
+                    pass
+            return out
+
+        # Scroll to top first
+        try:
+            driver.execute_script("arguments[0].scrollTop = 0;", container)
+        except Exception:
+            pass
+
+        # Walk the scrollable list to force lazy-load of all options
+        seen_count = -1
+        stable_iters = 0
+        while True:
+            options = collect_options()
+            if len(options) == seen_count:
+                stable_iters += 1
+            else:
+                stable_iters = 0
+            seen_count = len(options)
+
+            # Scroll down
+            try:
+                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight * 0.9;", container)
+            except Exception:
+                try:
+                    container.send_keys(Keys.END)
+                except Exception:
+                    pass
+
+            if stable_iters >= 2:
+                break
+            time.sleep(0.15)
+
+        options = collect_options()
+        target_norm = normalize_text(extract_clean_title(series_title))
+
+        exact = []
+        for el in options:
+            txt = (el.text or '').strip()
+            title_clean = extract_clean_title(txt)
+            if normalize_text(title_clean) != target_norm:
+                continue
+            inner = ''
+            try:
+                inner = el.get_attribute('innerHTML') or ''
+            except Exception:
+                inner = ''
+            series_like = has_series_label(txt) or bool(extract_tms_id(txt, 'SH')) or bool(extract_tms_id(inner, 'SH'))
+            exact.append((el, series_like))
+
+        if not exact:
+            return False
+
+        # If there is exactly one exact-title option, click it.
+        if len(exact) == 1:
+            el = exact[0][0]
+            try:
+                _scroll_into_view(driver, el)
+            except Exception:
+                pass
+            el.click()
+            time.sleep(1.5)
+            return True
+
+        # Multiple exact matches: only click if exactly one is series-like
+        series_only = [t for t in exact if t[1]]
+        if len(series_only) == 1:
+            el = series_only[0][0]
+            try:
+                _scroll_into_view(driver, el)
+            except Exception:
+                pass
+            el.click()
+            time.sleep(1.5)
+            return True
+
+        print_warning(f"Multiple autocomplete matches for '{series_title}' - letting grid/user resolve")
+        return False
+    except Exception:
+        return False
 
 def wait_for_manual_login(driver):
-    print_header("Manual Login Required")
-    print("Please log in manually in the browser window.")
-    print("Once logged in and you see the main Gracenote page,")
-    print("press ENTER here to continue...")
-    input()
-    print_success("Continuing automation...")
-
-def _scroll_into_view(driver, element):
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-    time.sleep(0.2)
+    print_header("Manual login required")
+    print("\nPlease log in to Gracenote in the browser window.")
+    print("Once logged in and you see the main page,")
+    input("press ENTER here to continue...\n")
+    print_success("Continuing with automation...")
 
 def click_programs_sidebar(driver, wait):
-    """
-    Attempt to click a 'Programs' link/button in the sidebar.
-    This is best-effort as the exact UI structure may vary.
-    """
+    print_step("Clicking 'Programs' in sidebar...")
     try:
-        sidebar_items = driver.find_elements(By.XPATH, "//*[contains(@class, 'sidebar') or contains(@class, 'nav')]//a | //*[contains(@class, 'sidebar') or contains(@class, 'nav')]//button")
-        for item in sidebar_items:
-            if 'program' in item.text.lower():
-                _scroll_into_view(driver, item)
-                item.click()
-                print_success("Navigated to Programs section")
-                time.sleep(1.0)
-                return True
+        # Wait a moment for page to be ready
+        time.sleep(1)
+        programs = wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Programs")))
+        programs.click()
+        time.sleep(2)
+        print_success("Programs page loaded")
+        return True
     except Exception as e:
-        print_warning(f"Could not navigate to Programs section: {e}")
-    return False
+        print_error(f"Error clicking Programs: {e}")
+        return False
 
 def select_series_filter(driver, wait):
-    """
-    Attempt to find and select the 'SERIES' filter dropdown option.
-    This is best-effort as the exact UI structure may vary.
-    """
+    print_step("Selecting 'SERIES' filter...")
+    timeout = float(CONFIG.get('wait_timeout', 10) or 10)
+    end = time.time() + timeout
+
+    def _looks_selected(el):
+        try:
+            ap = (el.get_attribute('aria-pressed') or '').strip().lower()
+            if ap == 'true':
+                return True
+        except Exception:
+            pass
+        try:
+            a = (el.get_attribute('aria-selected') or '').strip().lower()
+            if a == 'true':
+                return True
+        except Exception:
+            pass
+        try:
+            cls = (el.get_attribute('class') or '').lower()
+            if 'selected' in cls or 'active' in cls or 'mui-selected' in cls:
+                return True
+        except Exception:
+            pass
+        return False
+
+    # Anchor to the "Filter by Program Type" label if present
+    anchor = None
     try:
-        # Common patterns: a dropdown labeled "type" or similar
-        # Look for native <select> element with options
-        selects = driver.find_elements(By.TAG_NAME, "select")
-        for sel in selects:
-            options = sel.find_elements(By.TAG_NAME, "option")
-            for opt in options:
-                if 'series' in opt.text.lower():
-                    Select(sel).select_by_visible_text(opt.text)
-                    print_success("Applied SERIES filter")
-                    time.sleep(1.0)
-                    return True
-        # Try Material UI / custom dropdowns
-        # Find a dropdown trigger
-        triggers = driver.find_elements(By.XPATH, "//*[@role='button' or @role='combobox' or contains(@class, 'select')]")
-        for trigger in triggers:
-            if 'type' in trigger.text.lower() or 'filter' in trigger.text.lower():
-                _scroll_into_view(driver, trigger)
-                trigger.click()
-                time.sleep(0.3)
-                # Find option "SERIES"
-                options = driver.find_elements(By.XPATH, "//*[@role='option' or contains(@class, 'menu-item')]")
-                for opt in options:
-                    if 'series' in opt.text.lower():
-                        opt.click()
-                        print_success("Applied SERIES filter")
-                        time.sleep(1.0)
-                        return True
-    except Exception as e:
-        print_warning(f"Could not apply SERIES filter: {e}")
-    return False
+        anchor = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Filter by Program Type')]")
+    except Exception:
+        anchor = None
+
+    xpaths = [
+        ".//following::*[(self::button or self::div or self::span) and normalize-space(.)='SERIES'][1]",
+        ".//following::*[(self::button or self::div or self::span) and normalize-space(.)='Series'][1]",
+        "//*[self::button or self::div or self::span][normalize-space(.)='SERIES']",
+        "//*[@role='button' and normalize-space(.)='SERIES']",
+        "//*[self::button or self::div or self::span][normalize-space(.)='Series']",
+        "//*[@role='button' and normalize-space(.)='Series']",
+    ]
+
+    while time.time() < end:
+        try:
+            scope = anchor if anchor is not None else driver
+            for xp in xpaths:
+                try:
+                    els = scope.find_elements(By.XPATH, xp)
+                except Exception:
+                    els = []
+                for el in els:
+                    try:
+                        if not el.is_displayed():
+                            continue
+                        if _looks_selected(el):
+                            print_success('SERIES filter already selected')
+                            return True
+                        if _click_el(driver, el):
+                            time.sleep(0.6)
+                            print_success('SERIES filter applied')
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    print_warning('SERIES filter not clicked (may already be selected). Continuing anyway.')
+    return True
 
 def search_for_series(driver, wait, series_title):
-    print_step(f"Searching for series: '{series_title}'")
+    print_step(f"Searching for series: '{series_title}'...")
+    
+    if not series_title or series_title.strip() == '':
+        print_error("Series title is empty!")
+        return False
+    
     try:
-        search_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], input[type='search']")))
-        search_box.clear()
-        search_box.send_keys(series_title)
-        search_box.send_keys(Keys.RETURN)
-        time.sleep(2.0)
+        # Find the search input box
+        search_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[placeholder*='Program' i]")))
+        robust_clear_and_type(search_input, series_title, driver)
+        time.sleep(0.4)
+
+        # First try to click from autocomplete suggestions
+        if try_select_autocomplete_series(driver, wait, series_title):
+            print_success("Selected series from autocomplete")
+            return True
+
+        # Fallback: press Enter to show grid results, selection will happen in click_best_series_match
+        search_input.send_keys(Keys.RETURN)
+        time.sleep(2)
         print_success("Search submitted")
         return True
     except Exception as e:
-        print_error(f"Search failed: {e}")
-        return False
-
-def extract_series_tms_id(driver):
-    """
-    Extract the SH id from the current page. Could be in the URL or in visible text.
-    """
-    tms_id = extract_tms_id(driver.current_url, 'SH')
-    if not tms_id:
-        tms_id = extract_tms_id(driver.page_source, 'SH')
-    return tms_id
-
-def click_series_by_sh_id(driver, wait, sh_id):
-    """
-    After a search, click the series with the given SH id in the results table.
-    """
-    print_step(f"Selecting series with SH ID: {sh_id}")
-    try:
-        time.sleep(1.0)
-        links = driver.find_elements(By.TAG_NAME, "a")
-        for link in links:
-            if sh_id.lower() in (link.text or '').lower() or sh_id.lower() in (link.get_attribute('href') or '').lower():
-                _scroll_into_view(driver, link)
-                link.click()
-                time.sleep(2.0)
-                print_success(f"Clicked series with SH ID: {sh_id}")
-                return True
-        print_warning(f"Could not find link for SH ID: {sh_id}")
-        return False
-    except Exception as e:
-        print_error(f"Error clicking series by SH ID: {e}")
+        print_error(f"Error searching: {e}")
         return False
 
 def click_best_series_match(driver, wait, series_title, state):
-    """
-    After a search, find the best matching series from the results.
-    Return status: "ok", "ambiguous", "not_found", "fail"
-    If multiple plausible matches exist, return "ambiguous" so we can defer for user selection.
-    """
-    print_step(f"Looking for best match for series: '{series_title}'")
+    print_step('Analyzing search results for best match...')
     try:
-        time.sleep(1.5)
-        rows = driver.find_elements(By.TAG_NAME, "tr")
-        candidates = []
-        for row in rows:
-            row_text = row.text.lower()
-            if 'tms id' in row_text and 'title' in row_text:
-                continue
-            if 'sh' in row_text or 'series' in row_text.lower():
-                candidates.append(row)
-        if not candidates:
-            print_warning("No series results found")
-            return "not_found"
-        norm_title = normalize_text(series_title)
-        exact_matches = []
-        good_matches = []
-        for row in candidates:
-            row_norm = normalize_text(row.text)
-            if norm_title == row_norm or norm_title in row_norm:
-                exact_matches.append(row)
-            elif SequenceMatcher(None, norm_title, row_norm).ratio() > 0.75:
-                good_matches.append(row)
-        if len(exact_matches) == 1:
-            _scroll_into_view(driver, exact_matches[0])
-            links = exact_matches[0].find_elements(By.TAG_NAME, "a")
-            if links:
-                links[0].click()
-                time.sleep(2.0)
-                print_success("Selected exact series match")
-                return "ok"
-            else:
-                print_warning("No clickable link in exact match row")
-                return "fail"
-        elif len(exact_matches) > 1:
-            print_warning(f"Found {len(exact_matches)} exact matches - ambiguous")
-            return "ambiguous"
-        elif len(good_matches) == 1:
-            _scroll_into_view(driver, good_matches[0])
-            links = good_matches[0].find_elements(By.TAG_NAME, "a")
-            if links:
-                links[0].click()
-                time.sleep(2.0)
-                print_success("Selected good series match")
-                return "ok"
-            else:
-                print_warning("No clickable link in good match row")
-                return "fail"
-        elif len(good_matches) > 1:
-            print_warning(f"Found {len(good_matches)} good matches - ambiguous")
-            return "ambiguous"
-        else:
-            print_warning("No good series match found")
-            return "not_found"
+        if is_on_series_page(driver):
+            print_success('Already on a series page')
+            return 'ok'
+    except Exception:
+        pass
+
+    # Wait briefly for results links
+    try:
+        wait.until(lambda d: len(d.find_elements(By.XPATH, "//a[contains(@href, '/program-details')]")) > 0)
+    except Exception:
+        print_error('No results found after search')
+        return 'fail'
+
+    results = driver.find_elements(By.XPATH, "//a[contains(@href, '/program-details')]")
+    if not results:
+        print_error('No series results found')
+        return 'fail'
+
+    norm_target = normalize_text(extract_clean_title(series_title))
+
+    def _get_text(el):
+        try:
+            t = (el.text or '').strip()
+            if t:
+                return t
+        except Exception:
+            pass
+        for attr in ('aria-label', 'title'):
+            try:
+                t = (el.get_attribute(attr) or '').strip()
+                if t:
+                    return t
+            except Exception:
+                pass
+        try:
+            t = (el.get_attribute('textContent') or '').strip()
+            if t:
+                return t
+        except Exception:
+            pass
+        return ''
+
+    exact = []
+    for el in results:
+        txt = _get_text(el)
+        href = el.get_attribute('href') or ''
+        title_clean = extract_clean_title(txt)
+        is_series = bool(extract_tms_id(href, 'SH')) or has_series_label(txt) or bool(extract_tms_id(txt, 'SH'))
+        if normalize_text(title_clean) == norm_target:
+            exact.append((el, is_series))
+
+    # One exact-title result: click it even if text lacks 'Series'
+    if len(exact) == 1:
+        if _click_el(driver, exact[0][0]):
+            time.sleep(2)
+            print_success('Series page loaded')
+            return 'ok'
+        return 'fail'
+
+    # Multiple exact-title results: only auto-click if exactly one is series-like
+    if len(exact) > 1:
+        series_only = [t for t in exact if t[1]]
+        if len(series_only) == 1:
+            if _click_el(driver, series_only[0][0]):
+                time.sleep(2)
+                print_success('Series page loaded')
+                return 'ok'
+        print_warning(f"Multiple series named '{series_title}' found - deferring for user choice")
+        return 'ambiguous'
+
+    # Fallback: click the only result with an SH id in href
+    sh_results = []
+    for el in results:
+        try:
+            href = el.get_attribute('href') or ''
+            if extract_tms_id(href, 'SH'):
+                sh_results.append(el)
+        except Exception:
+            pass
+
+    if len(sh_results) == 1:
+        if _click_el(driver, sh_results[0]):
+            time.sleep(2)
+            print_success('Series page loaded (SH href fallback)')
+            return 'ok'
+
+    if len(sh_results) > 1:
+        print_warning(f"Multiple SH series candidates for '{series_title}' - deferring for user choice")
+        return 'ambiguous'
+
+    print_warning('No exact SERIES match for title in results')
+    return 'not_found'
+
+def extract_series_tms_id(driver):
+    """
+    Return the Series SH TMS ID from the current page (URL or page source).
+    """
+    try:
+        current_url = driver.current_url
+        tms_id = extract_tms_id(current_url, 'SH')
+        if tms_id:
+            print_success(f"Series TMS ID found: {tms_id}")
+            return tms_id
+
+        # Try page content if not present in URL
+        page_source = driver.page_source
+        tms_id = extract_tms_id(page_source, 'SH')
+        if tms_id:
+            print_success(f"Series TMS ID found: {tms_id}")
+            return tms_id
+
+        print_warning("Series TMS ID not found")
+        return ""
     except Exception as e:
-        print_error(f"Error finding series match: {e}")
-        return "fail"
+        print_error(f"Error extracting series TMS ID: {e}")
+        return ""
 
-def resolve_series_with_user(driver, wait, series_title, state):
+# --- Helper: best-effort check for series page context ---
+def is_on_series_page(driver):
     """
-    Prompt the user to manually select the correct series from search results, or skip.
-    Return "ok", "skip", or "fail".
-    Caches the choice in state['series_choice_cache'] for this run only.
+    Best-effort check that the current page is a Series details page.
     """
-    print_header(f"User Selection Required: '{series_title}'")
-    print("The script found multiple or no matching series in the search results.")
-    print("Please manually click on the correct series in the browser.")
-    print("Then choose:")
-    print("  1) I have selected the correct series (press ENTER)")
-    print("  2) Skip this series entirely (type 'skip' and press ENTER)")
-    choice = input("Your choice [ENTER to continue / 'skip' to skip]: ").strip().lower()
-    if choice == 'skip':
-        print_warning(f"Skipping series: {series_title}")
-        # Mark in cache to skip all episodes for this series this run
-        norm_key = normalize_text(series_title)
-        state.setdefault('series_choice_cache', {})[norm_key] = None
-        return "skip"
-    # User claims they have selected; extract the SH id from the page
-    series_tms_id = extract_series_tms_id(driver)
-    if series_tms_id:
-        print_success(f"User selected series with SH ID: {series_tms_id}")
-        norm_key = normalize_text(series_title)
-        state.setdefault('series_choice_cache', {})[norm_key] = series_tms_id
-        return "ok"
-    else:
-        print_error("Could not extract series TMS ID after user selection")
-        return "fail"
-
-def click_seasons_episodes_tab(driver, wait):
-    print_step("Opening 'Seasons & Episodes' tab...")
     try:
-        # Look for tab or link with text matching "season" and "episode"
-        tabs = driver.find_elements(By.XPATH, "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'season') and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'episode')]")
-        if tabs:
-            _scroll_into_view(driver, tabs[0])
-            tabs[0].click()
-            time.sleep(2.0)
-            print_success("Seasons & Episodes tab opened")
+        url = driver.current_url or ''
+        if 'program-details' in url or extract_tms_id(url, 'SH'):
             return True
-        print_warning("Could not find 'Seasons & Episodes' tab")
-        return False
-    except Exception as e:
-        print_error(f"Error opening Seasons & Episodes tab: {e}")
-        return False
-
-def _ensure_seasons_tab(driver, wait):
-    """
-    Ensure we are on the Seasons & Episodes tab. If not currently on it, click it.
-    """
+    except Exception:
+        pass
+    # Check for the tab label present on series pages
     try:
-        tabs = driver.find_elements(By.XPATH, "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'season') and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'episode')]")
-        if tabs:
-            _scroll_into_view(driver, tabs[0])
-            tabs[0].click()
-            time.sleep(1.5)
+        driver.find_element(By.XPATH, "//*[contains(text(), 'Seasons & Episodes')]")
+        return True
+    except Exception:
+        pass
+    # Fallback: look for an SH id in the page source
+    try:
+        if extract_tms_id(driver.page_source or '', 'SH'):
             return True
     except Exception:
         pass
     return False
 
-def select_season(driver, wait, season):
+def click_series_by_sh_id(driver, wait, sh_id):
     """
-    Select a given season from the season dropdown.
+    From a search results list, click the series whose link contains the given SH id.
     """
-    print_step(f"Selecting season: {season}")
-    desired = normalize_season_value(season)
-    if not desired:
-        print_warning("Season value could not be normalized")
-        return False
-    
-    # 1) Try native <select> elements first
     try:
-        selects = driver.find_elements(By.TAG_NAME, "select")
-        for sel in selects:
-            options = sel.find_elements(By.TAG_NAME, "option")
-            for opt in options:
-                if normalize_season_value(opt.text) == desired:
-                    Select(sel).select_by_visible_text(opt.text)
-                    time.sleep(1.5)
-                    print_success(f"Season {desired} selected")
-                    return True
+        # Prioritize anchors with href including the SH id
+        link = wait.until(EC.element_to_be_clickable((By.XPATH, f"//a[contains(@href, '{sh_id}')]")))
+        link.click()
+        time.sleep(2)
+        print_success(f"Selected series by SH id {sh_id}")
+        return True
+    except Exception:
+        # Fallback: any anchor whose text includes the SH id
+        try:
+            link = driver.find_element(By.XPATH, f"//a[contains(., '{sh_id}')]")
+            link.click()
+            time.sleep(2)
+            print_success(f"Selected series by SH id {sh_id} (fallback)")
+            return True
+        except Exception as e:
+            print_warning(f"Could not select by SH id: {e}")
+            return False
+
+
+# --- New helpers for collecting series options for user selection (kept for internal use) ---
+def _collect_series_from_autocomplete(driver, target_norm):
+    """
+    Scan the autocomplete listbox, scrolling to load all options.
+    Return a list of candidates [{'el': element, 'text': text, 'sh': 'SH...'}]
+    filtered to SERIES whose cleaned title matches target_norm.
+    """
+    try:
+        containers = driver.find_elements(By.CSS_SELECTOR, "ul[role='listbox'], div[role='listbox'], .MuiAutocomplete-popper [role='listbox']")
+        if not containers:
+            return []
+        container = containers[0]
+        # Scroll to top
+        try:
+            driver.execute_script("arguments[0].scrollTop = 0;", container)
+        except Exception:
+            pass
+
+        def collect():
+            opts = driver.find_elements(By.CSS_SELECTOR, "[role='option'], ul[role='listbox'] li, div[role='listbox'] li, [data-option-index]")
+            if not opts:
+                opts = driver.find_elements(By.XPATH, "//div[contains(@class,'Autocomplete') or contains(@class,'popper') or @role='listbox']//li")
+            # keep visible
+            return [o for o in opts if o.is_displayed()]
+
+        seen = -1
+        stable = 0
+        while True:
+            options = collect()
+            if len(options) == seen:
+                stable += 1
+            else:
+                stable = 0
+            seen = len(options)
+            # Scroll down a page
+            try:
+                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight * 0.95;", container)
+            except Exception:
+                try:
+                    container.send_keys(Keys.END)
+                except Exception:
+                    pass
+            if stable >= 2:
+                break
+            time.sleep(0.1)
+
+        options = collect()
+        out = []
+        for el in options:
+            txt = (el.text or '').strip()
+            title_clean = extract_clean_title(txt)
+            if normalize_text(title_clean) == target_norm and (has_series_label(txt) or bool(extract_tms_id(txt, 'SH')) or bool(extract_tms_id(el.get_attribute('innerHTML') or '', 'SH'))):
+                sh = extract_tms_id(txt, 'SH') or extract_tms_id(el.get_attribute('innerHTML') or '', 'SH')
+                out.append({'el': el, 'text': txt, 'sh': sh})
+        return out
+    except Exception:
+        return []
+
+def _collect_series_from_grid(driver, target_norm):
+    """
+    Collect SERIES candidates from the results grid.
+    Return a list of candidates [{'el': element, 'text': text, 'sh': 'SH...'}]
+    filtered to exact cleaned title matches.
+    SERIES detection is broadened to include SH ids in href.
+    """
+    try:
+        results = driver.find_elements(By.XPATH, "//a[contains(@href, '/program-details')]")
+        out = []
+        for el in results:
+            txt = (el.text or '').strip()
+            href = el.get_attribute('href') or ''
+            title_clean = extract_clean_title(txt)
+            is_series = ('SH' in href) or has_series_label(txt)
+            if normalize_text(title_clean) == target_norm and is_series:
+                sh = extract_tms_id(href, 'SH') or extract_tms_id(txt, 'SH') or extract_tms_id(el.get_attribute('outerHTML') or '', 'SH')
+                out.append({'el': el, 'text': txt, 'sh': sh})
+        return out
+    except Exception:
+        return []
+
+# ---------------------------------------------------------------------------
+# Pass 2 user selection is handled by clicking in the site UI
+# ---------------------------------------------------------------------------
+def resolve_series_with_user(driver, wait, series_title, state):
+    """
+    Pass 2: let the user click the correct SERIES in the browser UI.
+    - Opens Programs, applies SERIES filter, types the title to show the drop-down.
+    - You click the correct series option (or submit to grid and click the tile).
+    - The function waits until a series details page is detected, then continues.
+    """
+    print_header(f"User selection required for '{series_title}'")
+    series_key = normalize_text(series_title)
+
+    # Go to Programs and apply SERIES filter
+    if not click_programs_sidebar(driver, wait):
+        return "fail"
+    select_series_filter(driver, wait)
+
+    # Focus search box and show the autocomplete
+    try:
+        search_input = wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "input[placeholder*='Program' i]")
+        ))
+        robust_clear_and_type(search_input, series_title, driver)
+        time.sleep(0.6)
+    except Exception as e:
+        print_error(f"Could not focus search input: {e}")
+        return "fail"
+
+    print("\nMultiple SERIES share this exact title.")
+    print("Please do this in the browser window now:")
+    print("  1) Use the Program search drop-down and CLICK the correct SERIES")
+    print("     - or press Enter in the search box to open the grid, then CLICK the correct tile")
+    resp = input("After you have clicked and the series page opens, press ENTER here to continue (or type 'skip' to skip this entire series)... ").strip().lower()
+    if resp in ('skip', 's'):
+        state.setdefault('skipped_series', set()).add(series_key)
+        print_warning(f"User chose to skip series '{series_title}'")
+        return "skip"
+
+    # Wait briefly for the details page to be visible
+    try:
+        WebDriverWait(driver, 20).until(lambda d: is_on_series_page(d))
+        print_success("Series page detected")
+    except Exception:
+        print_warning("Could not automatically confirm series page. Continuing")
+
+    # Record the current series context for this run only
+    sh_id = extract_series_tms_id(driver) or ''
+    if sh_id:
+        state.setdefault('series_choice_cache', {})[series_key] = sh_id
+        print_success(f"Using SH id for this run: {sh_id}")
+    else:
+        print_warning("No SH id found on page. Proceeding without it")
+
+    state['current_series'] = series_title
+    state['on_seasons_tab'] = False
+    state['current_season'] = None
+    return "ok"
+
+
+def click_seasons_episodes_tab(driver, wait):
+    print_step("Clicking 'Seasons & Episodes' tab...")
+    try:
+        # Look for the tab - it might be a button or link
+        tab = wait.until(EC.element_to_be_clickable((By.XPATH, 
+            "//button[contains(text(), 'Seasons & Episodes')] | //a[contains(text(), 'Seasons & Episodes')] | //div[contains(text(), 'Seasons & Episodes')]")))
+        tab.click()
+        time.sleep(2)
+        print_success("Seasons & Episodes tab loaded")
+        return True
+    except Exception as e:
+        print_error(f"Error clicking Seasons & Episodes tab: {e}")
+        # Try alternative
+        try:
+            print_step("Trying alternative selector...")
+            tab = driver.find_element(By.XPATH, "//*[contains(text(), 'Seasons')]")
+            tab.click()
+            time.sleep(2)
+            print_success("Seasons tab loaded")
+            return True
+        except:
+            return False
+
+# --- Helpers to ensure Seasons & Episodes tab context and first page ---
+
+def _is_on_seasons_tab(driver):
+    """Best-effort check that the Seasons & Episodes tab content is visible."""
+    try:
+        # Presence of the MUI displayed rows label strongly indicates the episodes table
+        if _get_range_marker_el(driver):
+            return True
+    except Exception:
+        pass
+    try:
+        # Common anchors within the tab content
+        if driver.find_elements(By.XPATH, "//*[contains(text(), 'Season and Episode Summary') or contains(text(),'Export as .csv')]"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_seasons_tab(driver, wait, timeout=6):
+    """Open the Seasons & Episodes tab if not already open and wait for its content."""
+    if _is_on_seasons_tab(driver):
+        return True
+    if not click_seasons_episodes_tab(driver, wait):
+        return False
+    # Wait for content of the tab to appear
+    end = time.time() + timeout
+    while time.time() < end:
+        if _is_on_seasons_tab(driver):
+            return True
+        time.sleep(0.2)
+    return _is_on_seasons_tab(driver)
+
+
+def _wait_for_first_page(driver, timeout=4.0):
+    """Wait until the pager shows it is on the first page (starts with 1 - ...)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        label = _get_range_marker(driver)
+        if label:
+            m = re.search(r"^(\d+)\s*-\s*(\d+)\s*of\s*(\d+)$", label)
+            if m and int(m.group(1)) == 1:
+                return True
+        time.sleep(0.15)
+    return False
+
+def _read_current_season_value(driver):
+    """Best-effort: read the currently selected season number from the UI."""
+    # Native <select>
+    try:
+        dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
+        if dropdowns:
+            sel = Select(dropdowns[0])
+            try:
+                return normalize_season_value(sel.first_selected_option.text)
+            except Exception:
+                return ''
+    except Exception:
+        pass
+
+    # MUI / custom select
+    try:
+        cands = driver.find_elements(By.CSS_SELECTOR, "[role='combobox'], [aria-haspopup='listbox'], .MuiSelect-select")
+        for c in cands:
+            try:
+                if c.is_displayed():
+                    val = normalize_season_value(c.text)
+                    if val:
+                        return val
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return ''
+
+def select_season(driver, wait, season_number):
+    desired = normalize_season_value(season_number) or '1'
+    print_step(f"Selecting Season {desired}...")
+    # 1) Try native <select>
+    try:
+        # Prefer a select near the Season and Episode Summary section
+        dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
+        if dropdowns:
+            dropdown = dropdowns[0]
+            sel = Select(dropdown)
+            # Try visible text variations first
+            tried = False
+            for text in (f"Season {desired}", f"S{desired}", desired):
+                try:
+                    sel.select_by_visible_text(text)
+                    tried = True
+                    break
+                except Exception:
+                    pass
+            if not tried:
+                try:
+                    sel.select_by_value(desired)
+                    tried = True
+                except Exception:
+                    pass
+            if not tried:
+                # Last resort, iterate options and click the one whose number matches
+                for opt in sel.options:
+                    if normalize_season_value(opt.text) == desired or normalize_season_value(opt.get_attribute("value")) == desired:
+                        opt.click()
+                        tried = True
+                        break
+            if tried:
+                time.sleep(1.5)
+                print_success(f"Season {desired} selected")
+                return True
     except Exception as e:
         print_warning(f"Native select path failed: {e}")
 
     # 2) Try custom dropdowns (Material UI or similar)
     try:
-        # Find a trigger that looks like a season picker
+        # Preferred: click the visible "Season X" control near the Season and Episode Summary header
         trigger = None
-        # Common patterns: role=button or combobox with the word Season in it
-        triggers = driver.find_elements(By.XPATH,
-            "//*[self::div or self::button or self::span][(contains(@role,'button') or @role='combobox' or contains(@class,'select') or contains(@class,'MuiSelect')) and contains(normalize-space(.), 'Season')]")
-        if triggers:
-            trigger = triggers[0]
-        else:
-            # Fallback, any button-like element near 'Season and Episode Summary'
-            triggers = driver.find_elements(By.XPATH,
-                "//*[contains(., 'Season and Episode Summary')]/following::*[(self::div or self::button) and (contains(@role,'button') or contains(@class,'select') or contains(@class,'MuiSelect'))][1]")
-            if triggers:
-                trigger = triggers[0]
+        try:
+            trigger = driver.find_element(
+                By.XPATH,
+                "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[(self::div or self::button or self::span) and contains(normalize-space(.), 'Season ')][1]"
+            )
+        except Exception:
+            trigger = None
+
+        # Fallback: common MUI select triggers
+        if trigger is None:
+            candidates = driver.find_elements(
+                By.CSS_SELECTOR,
+                ".MuiSelect-select, .MuiInputBase-root [aria-haspopup='listbox'], [role='combobox'], [aria-haspopup='listbox']"
+            )
+            for el in candidates:
+                try:
+                    if el.is_displayed():
+                        trigger = el
+                        break
+                except Exception:
+                    continue
+
         if trigger:
-            trigger.click()
+            _click_el(driver, trigger)
             time.sleep(0.3)
-            # Options in MUI live under a listbox
-            options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
+
+            # Options in the popover list
+            options = driver.find_elements(
+                By.XPATH,
+                "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]"
+            )
+
+            # If listbox roles are missing, fall back to any visible items that include 'Season'
             if not options:
-                # Generic fallback
-                options = driver.find_elements(By.XPATH, f"//*[self::li or self::div or self::button][contains(normalize-space(.), 'Season {desired}') or normalize-space(.)='{desired}']")
+                options = driver.find_elements(By.XPATH, "//*[self::li or self::div or self::button][contains(normalize-space(.), 'Season ')]")
+
+            # Pick the option whose normalized season matches the desired value
             best = None
             for el in options:
-                txt = el.text.strip()
-                if normalize_season_value(txt) == desired:
-                    best = el
-                    break
-            if best is None and options:
-                best = options[0]
-            if best:
-                best.click()
-                time.sleep(1.5)
+                try:
+                    txt = (el.text or '').strip()
+                    if normalize_season_value(txt) == desired:
+                        best = el
+                        break
+                except Exception:
+                    continue
+
+            # Fallback: match exact text variations
+            if best is None:
+                for want in (f"Season {desired}", f"S{desired}", desired):
+                    for el in options:
+                        try:
+                            if (el.text or '').strip() == want:
+                                best = el
+                                break
+                        except Exception:
+                            continue
+                    if best is not None:
+                        break
+
+            if best and _click_el(driver, best):
+                time.sleep(1.2)
+                cur = _read_current_season_value(driver)
+                if cur and cur != desired:
+                    print_warning(f"Season picker readback '{cur}' did not match desired '{desired}'")
                 print_success(f"Season {desired} selected")
                 return True
     except Exception as e:
@@ -582,12 +1510,127 @@ def select_season(driver, wait, season):
     print_warning(f"Could not select season {desired}")
     return False
 
+
+# --- New helpers: get_available_seasons and find_episode_across_all_seasons ---
+
+def get_available_seasons(driver):
+    """Best-effort: return a sorted list of season numbers (as strings) available in the season dropdown."""
+    seasons = set()
+
+    # 1) Native <select> options
+    try:
+        dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
+        if dropdowns:
+            sel = Select(dropdowns[0])
+            for opt in sel.options:
+                v = normalize_season_value(opt.text) or normalize_season_value(opt.get_attribute('value'))
+                if v:
+                    seasons.add(v)
+            if seasons:
+                print_success(f"Found {len(seasons)} seasons via native <select>")
+    except Exception:
+        pass
+
+    # 2) Material UI style dropdown options (open and read listbox)
+    if not seasons:
+        try:
+            print_step("Opening season dropdown to enumerate available seasons...")
+            anchor = None
+            try:
+                anchor = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Season and Episode Summary')]")
+            except Exception:
+                anchor = None
+
+            scopes = [anchor, driver] if anchor is not None else [driver]
+
+            trigger = None
+            for scope in scopes:
+                try:
+                    cands = scope.find_elements(By.CSS_SELECTOR, ".MuiSelect-select, .MuiInputBase-root [aria-haspopup='listbox'], [role='combobox'], [aria-haspopup='listbox']")
+                except Exception:
+                    cands = []
+                for el in cands:
+                    try:
+                        if el.is_displayed():
+                            trigger = el
+                            break
+                    except Exception:
+                        continue
+                if trigger:
+                    break
+
+            if trigger:
+                _click_el(driver, trigger)
+                time.sleep(0.5)  # Give dropdown time to fully render
+                
+                # Look for all season options in the dropdown
+                options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
+                
+                for el in options:
+                    try:
+                        txt = (el.text or '').strip()
+                        v = normalize_season_value(txt)
+                        if v:
+                            seasons.add(v)
+                    except Exception:
+                        continue
+                
+                # Close menu (ESC)
+                try:
+                    driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                
+                if seasons:
+                    print_success(f"Found {len(seasons)} seasons via Material UI dropdown: {sorted(list(seasons), key=lambda x: int(x))}")
+        except Exception as e:
+            print_warning(f"Material UI dropdown enumeration failed: {e}")
+
+    # 3) REMOVED brute-force fallback that was trying seasons 1-30
+    # This approach was inefficient and caused the error messages in the output
+    # If we can't enumerate seasons via the dropdown, we'll fall back to scanning current season only
+
+    # Sort numerically
+    if seasons:
+        try:
+            sorted_seasons = [str(x) for x in sorted({int(s) for s in seasons})]
+            return sorted_seasons
+        except Exception:
+            return sorted(list(seasons))
+    else:
+        return []
+
+
+def find_episode_across_all_seasons(driver, wait, episode_title):
+    """Loop seasons and search within each season until the episode is found."""
+    if not _ensure_seasons_tab(driver, wait):
+        return "", "Failed to load Seasons & Episodes tab"
+
+    print_step("Search All Seasons active: will scan every season in the series...")
+    seasons = get_available_seasons(driver)
+    
+    if not seasons:
+        # Fallback: we can only scan the currently visible season
+        print_warning("Could not enumerate seasons. Scanning current season only.")
+        return find_episode_tms_id(driver, wait, episode_title, current_season=None)
+    
+    print_success(f"Will search through {len(seasons)} season(s): {', '.join(seasons)}")
+    print_step(f"Looking for episode: {episode_title}")
+
+    for s in seasons:
+        print_step(f"Selecting Season {s}...")
+        if not select_season(driver, wait, s):
+            print_warning(f"Could not select season {s}")
+            continue
+        _wait_for_first_page(driver, timeout=4.0)
+        ep_id, note = find_episode_tms_id(driver, wait, episode_title, current_season=s)
+        if ep_id:
+            return ep_id, ""
+
+    return "", "Episode not found in any season - manual verification needed"
+
 def find_episode_tms_id(driver, wait, episode_title, current_season=None):
-    """
-    Search for an episode TMS ID.
-    If CONFIG['ignore_season_filter'] is True, searches across all seasons.
-    Otherwise, searches within the current season only.
-    """
     print_step(f"Searching for episode: '{episode_title}'...")
     
     if not episode_title or episode_title.strip() == '':
@@ -676,35 +1719,6 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
         return None
 
     try:
-        # NEW: If ignoring season filter, we need to search across all seasons
-        if CONFIG['ignore_season_filter']:
-            print_step("Searching across all seasons (season filter disabled)")
-            # First try the current view
-            result = forward_walk()
-            if result:
-                return result, ""
-            
-            # If not found, try to cycle through available seasons
-            # This is best-effort - we'll try to find all season options and search each
-            if _ensure_seasons_tab(driver, wait):
-                available_seasons = _get_available_seasons(driver)
-                if available_seasons:
-                    print_step(f"Found {len(available_seasons)} seasons, searching each...")
-                    for season_num in available_seasons:
-                        print_step(f"Checking Season {season_num}...")
-                        if select_season(driver, wait, str(season_num)):
-                            time.sleep(1.0)
-                            _wait_for_first_page(driver, timeout=4.0)
-                            result = forward_walk()
-                            if result:
-                                return result, f"Found in Season {season_num}"
-                    print_warning(f"Episode not found in any of {len(available_seasons)} seasons")
-                else:
-                    print_warning("Could not detect available seasons")
-            
-            return "", "Episode not found across all seasons"
-        
-        # ORIGINAL: Use season-specific search
         # First forward pass
         result = forward_walk()
         if result:
@@ -722,148 +1736,105 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
                         return result, ""
                 else:
                     print_warning(f"Could not select season {current_season}")
-        
-        print_warning(f"Episode not found: {episode_title}")
-        return "", "Episode not found"
+            else:
+                print_warning("Could not open Seasons & Episodes tab for reset")
+
+        print_warning("All pages have been looked at. Episode not found")
+        return "", "Episode not found - manual verification needed"
+
     except Exception as e:
-        print_error(f"Error searching for episode: {e}")
-        return "", f"Error: {str(e)}"
+        print_error(f"Error finding episode: {e}")
+        return "", f"Error: {e}"
 
-def _get_available_seasons(driver):
-    """
-    NEW: Attempt to detect all available season numbers from the season dropdown.
-    Returns a list of season numbers (as integers) or empty list if cannot detect.
-    """
-    try:
-        # Try native select first
-        selects = driver.find_elements(By.TAG_NAME, "select")
-        for sel in selects:
-            options = sel.find_elements(By.TAG_NAME, "option")
-            seasons = []
-            for opt in options:
-                season_num = normalize_season_value(opt.text)
-                if season_num:
-                    try:
-                        seasons.append(int(season_num))
-                    except:
-                        pass
-            if seasons:
-                return sorted(seasons)
-        
-        # Try custom dropdown
-        triggers = driver.find_elements(By.XPATH,
-            "//*[self::div or self::button or self::span][(contains(@role,'button') or @role='combobox' or contains(@class,'select') or contains(@class,'MuiSelect')) and contains(normalize-space(.), 'Season')]")
-        if triggers:
-            trigger = triggers[0]
-            trigger.click()
-            time.sleep(0.3)
-            options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
-            seasons = []
-            for opt in options:
-                season_num = normalize_season_value(opt.text)
-                if season_num:
-                    try:
-                        seasons.append(int(season_num))
-                    except:
-                        pass
-            # Close the dropdown
-            trigger.click()
-            time.sleep(0.2)
-            if seasons:
-                return sorted(seasons)
-    except Exception as e:
-        print_warning(f"Could not detect available seasons: {e}")
-    return []
+def process_episode(driver, wait, episode, index, total, state, allow_defer=True):
+    print(f"\n\n📺 Episode {index + 1}/{total}")
+    print("─" * 70)
+    
+    # Try multiple column name variations
+    series_title = (episode.get('SeriesTitle') or 
+                   episode.get('Series') or 
+                   episode.get('series_title') or 
+                   episode.get('Show') or '').strip()
+    series_key = normalize_text(series_title)
+    # If this series was already marked for deferred resolution, skip immediately on first pass
+    if allow_defer and (series_key in state.get('ambiguous_series', set()) or series_key in state.get('unresolved_series', set())):
+        episode['Notes'] = "Deferred entire series awaiting user selection"
+        state.setdefault('deferred', []).append(episode)
+        print_warning(f"Skipping episode for deferred series '{series_title}'")
+        return
+    
+    episode_title = (episode.get('EpisodeTitle') or 
+                    episode.get('Title') or 
+                    episode.get('episode_title') or 
+                    episode.get('Episode') or '').strip()
+    
+    raw_season = (episode.get('Season') or episode.get('season') or '1')
+    season = normalize_season_value(raw_season) or '1'
+    
+    print(f"   Series: \"{series_title}\"")
+    print(f"   Episode: \"{episode_title}\"")
+    print(f"   Season: {season}")
 
-def _get_range_marker(driver):
-    """
-    Extract the current page range indicator text (e.g., "1 - 50 of 250") if visible.
-    Returns the text or None if not found.
-    """
-    try:
-        markers = driver.find_elements(By.XPATH, "//*[contains(text(), ' of ') or contains(text(), ' - ')]")
-        for m in markers:
-            txt = m.text.strip()
-            if re.search(r'\d+\s*-\s*\d+\s+of\s+\d+', txt, flags=re.IGNORECASE):
-                return txt
-    except Exception:
-        pass
-    return None
 
-def _click_next_page(driver):
-    """
-    Click the 'Next' pagination button. Returns True if clicked, False if button not found or disabled.
-    """
-    try:
-        # Common patterns: button with 'next' text or aria-label, or icon buttons
-        candidates = driver.find_elements(By.XPATH,
-            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')] | "
-            "//button[contains(@aria-label, 'next')] | "
-            "//button[contains(@aria-label, 'Next')] | "
-            "//*[@role='button' and contains(., 'next')] | "
-            "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]")
-        for btn in candidates:
-            if btn.is_displayed() and btn.is_enabled():
-                _scroll_into_view(driver, btn)
-                btn.click()
-                return True
-        # Also try icon-based pagination (arrow right)
-        icons = driver.find_elements(By.XPATH, "//button[contains(@aria-label, 'Go to next page') or contains(@title, 'Next')]")
-        for icon in icons:
-            if icon.is_displayed() and icon.is_enabled():
-                _scroll_into_view(driver, icon)
-                icon.click()
-                return True
-    except Exception:
-        pass
-    return False
+    # Consider both canonical and alternate column names
+    prefilled_ep_tms = _get_first(episode, ['EpisodeTMSID', 'Episode TMS ID', 'Episode_TMS_ID'])
+    prefilled_series_tms = _get_first(episode, ['SeriesTMSID', 'Series TMS ID', 'Series_TMS_ID'])
 
-def _wait_for_first_page(driver, timeout=4.0):
-    """
-    Wait for the page range indicator to show '1 - ...' to confirm we're back at page 1.
-    """
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        marker = _get_range_marker(driver)
-        if marker and marker.strip().startswith('1 -'):
-            return True
-        time.sleep(0.5)
-    return False
-
-def process_episode(driver, wait, episode, episode_index, total_episodes, state, allow_defer=True):
-    print_header(f"Episode {episode_index + 1}/{total_episodes}")
+    if _value_means_done(prefilled_ep_tms) or _value_is_one(prefilled_series_tms):
+        reason_bits = []
+        if prefilled_ep_tms:
+            reason_bits.append(f"EpisodeTMSID={prefilled_ep_tms}")
+        if prefilled_series_tms:
+            reason_bits.append(f"SeriesTMSID={prefilled_series_tms}")
+        reason = "; ".join(reason_bits) if reason_bits else "pre-filled markers"
+        print_step(f"TMS already present or marked as 1 ({reason}) - skipping row")
+        return
+    
+    # Check for empty values
+    if not series_title:
+        print_error("Series title is empty - skipping")
+        episode['SeriesTMSID'] = ''
+        episode['EpisodeTMSID'] = ''
+        episode['Notes'] = 'Series title is empty'
+        return
+    
+    if not episode_title:
+        print_error("Episode title is empty - skipping")
+        episode['SeriesTMSID'] = ''
+        episode['EpisodeTMSID'] = ''
+        episode['Notes'] = 'Episode title is empty'
+        return
+    
+    episode['SeriesTMSID'] = episode.get('SeriesTMSID', '')
+    episode['EpisodeTMSID'] = episode.get('EpisodeTMSID', '')
+    episode['Notes'] = episode.get('Notes', '')
     
     try:
-        series_title = episode.get('SeriesTitle') or episode.get('Series') or episode.get('series_title') or episode.get('Show') or ''
-        episode_title = episode.get('EpisodeTitle') or episode.get('Title') or episode.get('episode_title') or episode.get('Episode') or ''
-        season = episode.get('Season') or episode.get('season') or '1'
-        
-        print(f"   Series: {series_title}")
-        print(f"   Episode: {episode_title}")
-        print(f"   Season: {season}")
-        
-        if not series_title:
-            print_error("Series title is missing!")
-            episode['Notes'] = "Series title is missing"
-            return
-        
-        if not episode_title:
-            print_error("Episode title is missing!")
-            episode['Notes'] = "Episode title is missing"
-            return
-        
-        series_key = normalize_text(series_title)
+        # Use cached choice if available (in-run only)
         cached_sh = state.get('series_choice_cache', {}).get(series_key)
-        if cached_sh is None:
-            # User explicitly skipped this series in a prior interaction this run
-            episode['EpisodeTMSID'] = '1'
-            episode['Notes'] = 'Skipped series by user'
-            print_warning(f"Series '{series_title}' was skipped by user")
-            return
-        
-        # Navigate to the series if not already there
+        # Sanity check: if state says we are on this series, verify page context and SH id
+        if state.get('current_series') == series_title:
+            if not is_on_series_page(driver):
+                print_warning("Not currently on a series page - forcing reselect of series")
+                state['current_series'] = None
+                state['on_seasons_tab'] = False
+                state['current_season'] = None
+            else:
+                try:
+                    page_sh = extract_series_tms_id(driver)
+                except Exception:
+                    page_sh = ''
+                if cached_sh and page_sh and cached_sh != page_sh:
+                    print_warning(f"Series SH mismatch (page {page_sh} vs cached {cached_sh}) - forcing reselect of series")
+                    state['current_series'] = None
+                    state['on_seasons_tab'] = False
+                    state['current_season'] = None
         if state.get('current_series') != series_title:
-            print_step(f"Switching to series: {series_title}")
+            if not click_programs_sidebar(driver, wait):
+                episode['Notes'] = "Failed to click Programs"
+                return
+
+            select_series_filter(driver, wait)
 
             if not search_for_series(driver, wait, series_title):
                 if allow_defer:
@@ -937,24 +1908,35 @@ def process_episode(driver, wait, episode, episode_index, total_episodes, state,
         else:
             print_step("Seasons & Episodes tab already open - skipping")
   
-        # NEW: Only select season if we're NOT ignoring season filter
-        if not CONFIG['ignore_season_filter']:
-            # Select season only if it changed
-            if state.get('current_season') != season:
-                if not select_season(driver, wait, season):
-                    episode['Notes'] = f"Failed to select season {season}"
-                    return
-                state['current_season'] = season
-                time.sleep(1.0)
-            else:
-                print_step(f"Season {season} already selected - skipping")
-        else:
-            print_step("Season filter disabled - will search across all seasons")
 
-        episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, season if not CONFIG['ignore_season_filter'] else None)
+
+
+  
+        # --- START OF MODIFICATION ---
+        # Determine if we should skip season selection
+
+        skip_season_selection = (not allow_defer) and CONFIG.get('ignore_season_on_second_pass', False)
+        if skip_season_selection:
+            print_step("Search All Seasons active: will scan every season in the series...")
+        else:
+            # Ensure correct season is selected (original logic)
+            if state.get('current_season') != season:
+                print_step(f"Selecting season: {season}")
+                if select_season(driver, wait, season):
+                    state['current_season'] = season
+                    time.sleep(1)
+        # --- END OF MODIFICATION ---
+        
+        print_step(f"Looking for episode: {episode_title}")
+        if skip_season_selection:
+            episode_tms_id, note = find_episode_across_all_seasons(driver, wait, episode_title)
+        else:
+            episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, season)
         episode['EpisodeTMSID'] = episode_tms_id
         if note:
             episode['Notes'] = note
+        
+        
 
     except Exception as e:
         print_error(f"Error processing episode: {e}")
