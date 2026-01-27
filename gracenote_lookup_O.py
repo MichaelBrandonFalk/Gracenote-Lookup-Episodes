@@ -1377,8 +1377,15 @@ def _wait_for_first_page(driver, timeout=4.0):
     return False
 
 def select_season(driver, wait, season_number):
-    desired = normalize_season_value(season_number) or '1'
-    print_step(f"Selecting Season {desired}...")
+    raw = str(season_number or '').strip()
+    raw_l = raw.lower()
+    is_no_season = raw_l in ('no season', 'no seasons', 'noseason', 'no', 'none', '0') or ('no season' in raw_l)
+
+    desired = 'No Season' if is_no_season else (normalize_season_value(season_number) or '1')
+    if is_no_season:
+        print_step("Selecting No Season...")
+    else:
+        print_step(f"Selecting Season {desired}...")
     # Ensure we are actually on the Seasons & Episodes tab (back/paging can drop us out)
     try:
         _ensure_seasons_tab(driver, wait, timeout=6)
@@ -1398,16 +1405,29 @@ def select_season(driver, wait, season_number):
         if dropdown is None:
             selects = driver.find_elements(By.TAG_NAME, "select")
 
+            # If we are trying to select "No Season", prefer a select that actually offers it
+            if is_no_season:
+                for sel_el in selects:
+                    try:
+                        sel_obj = Select(sel_el)
+                        opt_blob = " ".join((opt.text or '') for opt in sel_obj.options).lower()
+                        if 'no season' in opt_blob:
+                            dropdown = sel_el
+                            break
+                    except Exception:
+                        continue
+
             # Prefer selects explicitly labeled as season
-            for sel_el in selects:
-                try:
-                    aria = (sel_el.get_attribute('aria-label') or '').lower()
-                    name = (sel_el.get_attribute('name') or '').lower()
-                    if 'season' in aria or 'season' in name:
-                        dropdown = sel_el
-                        break
-                except Exception:
-                    continue
+            if dropdown is None:
+                for sel_el in selects:
+                    try:
+                        aria = (sel_el.get_attribute('aria-label') or '').lower()
+                        name = (sel_el.get_attribute('name') or '').lower()
+                        if 'season' in aria or 'season' in name:
+                            dropdown = sel_el
+                            break
+                    except Exception:
+                        continue
 
         # Last fallback: pick a select whose option texts include the word "Season"
         if dropdown is None:
@@ -1435,7 +1455,7 @@ def select_season(driver, wait, season_number):
             sel = Select(dropdown)
             # Try visible text variations first
             tried = False
-            for text in (f"Season {desired}", f"S{desired}", desired):
+            for text in (("No Season", "No Seasons") if is_no_season else (f"Season {desired}", f"S{desired}", desired)):
                 try:
                     sel.select_by_visible_text(text)
                     tried = True
@@ -1451,10 +1471,16 @@ def select_season(driver, wait, season_number):
             if not tried:
                 # Last resort, iterate options and click the one whose number matches
                 for opt in sel.options:
-                    if normalize_season_value(opt.text) == desired or normalize_season_value(opt.get_attribute("value")) == desired:
-                        opt.click()
-                        tried = True
-                        break
+                    if is_no_season:
+                        if 'no season' in (opt.text or '').strip().lower():
+                            opt.click()
+                            tried = True
+                            break
+                    else:
+                        if normalize_season_value(opt.text) == desired or normalize_season_value(opt.get_attribute("value")) == desired:
+                            opt.click()
+                            tried = True
+                            break
             if tried:
                 # Wait for table/pager to refresh for the newly selected season
                 try:
@@ -1497,10 +1523,15 @@ def select_season(driver, wait, season_number):
                 options = driver.find_elements(By.XPATH, f"//*[self::li or self::div or self::button][contains(normalize-space(.), 'Season {desired}') or normalize-space(.)='{desired}']")
             best = None
             for el in options:
-                txt = el.text.strip()
-                if normalize_season_value(txt) == desired:
-                    best = el
-                    break
+                txt = (el.text or '').strip()
+                if is_no_season:
+                    if 'no season' in txt.lower():
+                        best = el
+                        break
+                else:
+                    if normalize_season_value(txt) == desired:
+                        best = el
+                        break
             if best is None and options:
                 best = options[0]
             if best:
@@ -1615,14 +1646,36 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
         try:
             dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
             if dropdowns:
-                sel = Select(dropdowns[0])
-                nums = []
-                for opt in sel.options:
-                    n = normalize_season_value(opt.text) or normalize_season_value(opt.get_attribute('value'))
-                    if n and n not in nums:
-                        nums.append(n)
-                if nums:
-                    return nums
+                best_sel = None
+                best_blob = ""
+                # Pick the select that looks most like the Season picker (ideally includes 'season' or 'no season')
+                for dd in dropdowns:
+                    try:
+                        sel_obj = Select(dd)
+                        opt_blob = " ".join((opt.text or '') for opt in sel_obj.options).lower()
+                        if 'no season' in opt_blob:
+                            best_sel = sel_obj
+                            best_blob = opt_blob
+                            break
+                        if best_sel is None and 'season' in opt_blob:
+                            best_sel = sel_obj
+                            best_blob = opt_blob
+                    except Exception:
+                        continue
+
+                if best_sel:
+                    nums = []
+                    for opt in best_sel.options:
+                        txt = (opt.text or '').strip()
+                        if 'no season' in txt.lower():
+                            if 'No Season' not in nums:
+                                nums.append('No Season')
+                            continue
+                        n = normalize_season_value(txt) or normalize_season_value(opt.get_attribute('value'))
+                        if n and n not in nums:
+                            nums.append(n)
+                    if nums:
+                        return nums
         except Exception:
             pass
 
@@ -1650,6 +1703,13 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
                     if fail_streak >= 2:
                         break
                 continue
+        # Also include "No Season" if available
+        try:
+            if select_season(driver, wait, 'No Season'):
+                if 'No Season' not in found:
+                    found.append('No Season')
+        except Exception:
+            pass
         return found
 
     def _search_all_seasons():
