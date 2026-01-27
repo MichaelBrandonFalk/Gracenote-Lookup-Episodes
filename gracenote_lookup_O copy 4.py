@@ -1628,27 +1628,13 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
 
         # 2) Fallback: probe a reasonable range and keep the ones that actually select
         found = []
-        fail_streak = 0
         for i in range(1, max_fallback + 1):
             s = str(i)
             try:
                 if select_season(driver, wait, s):
                     if s not in found:
                         found.append(s)
-                    fail_streak = 0
-                else:
-                    # Once we've found at least one season, stop after 2 consecutive misses.
-                    # Example: if 10 and 11 both fail, assume the highest season is 9.
-                    if found:
-                        fail_streak += 1
-                        if fail_streak >= 2:
-                            break
             except Exception:
-                # Treat errors as a miss for the purpose of early-stop.
-                if found:
-                    fail_streak += 1
-                    if fail_streak >= 2:
-                        break
                 continue
         return found
 
