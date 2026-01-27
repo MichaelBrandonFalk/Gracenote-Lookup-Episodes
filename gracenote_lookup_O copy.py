@@ -22,6 +22,7 @@ from selenium.webdriver.common.keys import Keys
 from webdriver_manager.chrome import ChromeDriverManager
 
 # Configuration
+# Configuration
 CONFIG = {
     'input_csv': 'InputEpisodes.csv',
     'output_csv': 'OutputEpisodes_WithTMSIDs.csv',
@@ -29,32 +30,43 @@ CONFIG = {
     'wait_timeout': 10,
     'delay_between_episodes': 2,
     'second_pass_only': False,
-    'ignore_season_on_second_pass': False  # <--- Add this line
+    'ignore_season_search': False,
 }
 
 
 def prompt_mode_choice():
+    """
+    Ask the user which mode to run: normal two-pass or second pass only.
+    Sets CONFIG['second_pass_only'] based on the answer.
+    """
     try:
         print("\nRun mode:")
         print("  1) Normal two-pass workflow")
         print("  2) Second pass only (skip first pass)")
         choice = input("Choose 1 or 2 [1]: ").strip()
-        CONFIG['second_pass_only'] = (choice == '2')
-        
-        # Add the new toggle prompt here
-        print("\nSeason handling for second pass:")
-        print("  1) Search specific season from CSV")
-        print("  2) Ignore season number (search entire series)")
-        s_choice = input("Choose 1 or 2 [1]: ").strip()
-        if s_choice == '2':
-            CONFIG['ignore_season_on_second_pass'] = True
-            print_success("Ignore Season enabled for second pass")
+        if choice == '2':
+            CONFIG['second_pass_only'] = True
+            print_success("Second pass only mode enabled")
         else:
-            CONFIG['ignore_season_on_second_pass'] = False
-            print_success("Specific season matching enabled")
-            
+            CONFIG['second_pass_only'] = False
+            print_success("Normal mode selected")
     except Exception:
-        print_warning("Could not read input. Using default settings.")
+        # Fallback to default if input fails
+        print_warning("Could not read input. Using default mode")
+
+def prompt_ignore_season_choice():
+    """Ask the user whether to ignore season filtering when searching for episodes."""
+    try:
+        choice = input("Ignore season filter? (y/N): ").strip().lower()
+        if choice in ('y', 'yes'):
+            CONFIG['ignore_season_search'] = True
+            print_success("Ignore season filter enabled")
+        else:
+            CONFIG['ignore_season_search'] = False
+            print_success("Ignore season filter disabled")
+    except Exception:
+        print_warning("Could not read input. Using default ignore season setting")
+
 
 # ---------------------------------------------------------------------------
 # No persistence across runs
@@ -1364,364 +1376,86 @@ def _wait_for_first_page(driver, timeout=4.0):
         time.sleep(0.15)
     return False
 
-def _read_current_season_value(driver):
-    """Best-effort: read the currently selected season number from the UI."""
-    # Native <select>
-    try:
-        dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
-        if dropdowns:
-            sel = Select(dropdowns[0])
-            try:
-                return normalize_season_value(sel.first_selected_option.text)
-            except Exception:
-                return ''
-    except Exception:
-        pass
-
-    # MUI / custom select
-    try:
-        cands = driver.find_elements(By.CSS_SELECTOR, "[role='combobox'], [aria-haspopup='listbox'], .MuiSelect-select")
-        for c in cands:
-            try:
-                if c.is_displayed():
-                    val = normalize_season_value(c.text)
-                    if val:
-                        return val
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return ''
-
 def select_season(driver, wait, season_number):
     desired = normalize_season_value(season_number) or '1'
     print_step(f"Selecting Season {desired}...")
-
-    def _close_any_open_menu():
-        try:
-            driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
-            time.sleep(0.15)
-        except Exception:
-            pass
-
-    def _wait_listbox(timeout=3.0):
-        end = time.time() + timeout
-        last = None
-        while time.time() < end:
-            try:
-                lbs = driver.find_elements(By.XPATH, "//*[@role='listbox']")
-                lbs = [lb for lb in lbs if lb.is_displayed()]
-                if lbs:
-                    last = lbs[-1]
-                    return last
-            except Exception:
-                pass
-            time.sleep(0.05)
-        return last
-
-    def _season_option_match(txt: str) -> bool:
-        t = (txt or '').strip()
-        if not t:
-            return False
-        v = normalize_season_value(t)
-        return v == desired
-
-    # Try up to 3 times, because MUI selects can re-render and stale the trigger
-    for attempt in range(1, 4):
-        # 1) Try native <select>
-        try:
-            dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
-            if dropdowns:
-                dropdown = dropdowns[0]
-                sel = Select(dropdown)
-                tried = False
-                for text in (f"Season {desired}", f"S{desired}", desired):
-                    try:
-                        sel.select_by_visible_text(text)
+    # 1) Try native <select>
+    try:
+        # Prefer a select near the Season and Episode Summary section
+        dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
+        if dropdowns:
+            dropdown = dropdowns[0]
+            sel = Select(dropdown)
+            # Try visible text variations first
+            tried = False
+            for text in (f"Season {desired}", f"S{desired}", desired):
+                try:
+                    sel.select_by_visible_text(text)
+                    tried = True
+                    break
+                except Exception:
+                    pass
+            if not tried:
+                try:
+                    sel.select_by_value(desired)
+                    tried = True
+                except Exception:
+                    pass
+            if not tried:
+                # Last resort, iterate options and click the one whose number matches
+                for opt in sel.options:
+                    if normalize_season_value(opt.text) == desired or normalize_season_value(opt.get_attribute("value")) == desired:
+                        opt.click()
                         tried = True
                         break
-                    except Exception:
-                        pass
-                if not tried:
-                    try:
-                        sel.select_by_value(desired)
-                        tried = True
-                    except Exception:
-                        pass
-                if not tried:
-                    for opt in sel.options:
-                        if normalize_season_value(opt.text) == desired or normalize_season_value(opt.get_attribute("value")) == desired:
-                            opt.click()
-                            tried = True
-                            break
-                if tried:
-                    time.sleep(0.6)
-                    cur = _read_current_season_value(driver)
-                    if not cur or cur == desired:
-                        print_success(f"Season {desired} selected")
-                        return True
-        except Exception:
-            pass
+            if tried:
+                time.sleep(1.5)
+                print_success(f"Season {desired} selected")
+                return True
+    except Exception as e:
+        print_warning(f"Native select path failed: {e}")
 
-        # 2) Custom / MUI select
-        try:
-            _close_any_open_menu()
-
-            # Re-find a trigger each attempt
-            trigger = None
-
-            # Preferred: something right after the Season and Episode Summary area
-            try:
-                trigger = driver.find_element(
-                    By.XPATH,
-                    "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[(self::div or self::button or self::span) and (@role='combobox' or @aria-haspopup='listbox' or contains(@class,'MuiSelect') or contains(@class,'MuiInputBase'))][1]"
-                )
-            except Exception:
-                trigger = None
-
-            # Fallback: any visible MUI select/combobox
-            if trigger is None:
-                candidates = driver.find_elements(
-                    By.CSS_SELECTOR,
-                    ".MuiSelect-select, .MuiInputBase-root [aria-haspopup='listbox'], [role='combobox'], [aria-haspopup='listbox']"
-                )
-                for el in candidates:
-                    try:
-                        if el.is_displayed():
-                            trigger = el
-                            break
-                    except Exception:
-                        continue
-
-            if not trigger:
-                continue
-
-            # Open dropdown
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", trigger)
-            except Exception:
-                pass
-            if not _click_el(driver, trigger):
-                continue
-
-            lb = _wait_listbox(timeout=3.0)
-            if not lb:
-                _close_any_open_menu()
-                continue
-
-            # Options inside the currently open listbox only
-            options = []
-            try:
-                options = lb.find_elements(By.XPATH, ".//*[@role='option'] | .//li")
-            except Exception:
-                options = []
-
-            # If roles are missing, fall back to any visible menu items
+    # 2) Try custom dropdowns (Material UI or similar)
+    try:
+        # Find a trigger that looks like a season picker
+        trigger = None
+        # Common patterns: role=button or combobox with the word Season in it
+        triggers = driver.find_elements(By.XPATH,
+            "//*[self::div or self::button or self::span][(contains(@role,'button') or @role='combobox' or contains(@class,'select') or contains(@class,'MuiSelect')) and contains(normalize-space(.), 'Season')]")
+        if triggers:
+            trigger = triggers[0]
+        else:
+            # Fallback, any button-like element near 'Season and Episode Summary'
+            triggers = driver.find_elements(By.XPATH,
+                "//*[contains(., 'Season and Episode Summary')]/following::*[(self::div or self::button) and (contains(@role,'button') or contains(@class,'select') or contains(@class,'MuiSelect'))][1]")
+            if triggers:
+                trigger = triggers[0]
+        if trigger:
+            trigger.click()
+            time.sleep(0.3)
+            # Options in MUI live under a listbox
+            options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
             if not options:
-                try:
-                    options = driver.find_elements(By.XPATH, "//li[contains(@class,'MuiMenuItem') and normalize-space(.)!='']")
-                    options = [o for o in options if o.is_displayed()]
-                except Exception:
-                    options = []
-
+                # Generic fallback
+                options = driver.find_elements(By.XPATH, f"//*[self::li or self::div or self::button][contains(normalize-space(.), 'Season {desired}') or normalize-space(.)='{desired}']")
             best = None
             for el in options:
-                try:
-                    txt = (el.text or '').strip()
-                    if _season_option_match(txt):
-                        best = el
-                        break
-                except Exception:
-                    continue
-
-            if best and _click_el(driver, best):
-                time.sleep(0.6)
-                cur = _read_current_season_value(driver)
-                if not cur or cur == desired:
-                    print_success(f"Season {desired} selected")
-                    return True
-
-            _close_any_open_menu()
-        except Exception:
-            _close_any_open_menu()
-
-        # Small backoff before retry
-        time.sleep(0.25)
+                txt = el.text.strip()
+                if normalize_season_value(txt) == desired:
+                    best = el
+                    break
+            if best is None and options:
+                best = options[0]
+            if best:
+                best.click()
+                time.sleep(1.5)
+                print_success(f"Season {desired} selected")
+                return True
+    except Exception as e:
+        print_warning(f"Custom dropdown path failed: {e}")
 
     print_warning(f"Could not select season {desired}")
     return False
-
-
-# --- New helpers: get_available_seasons and find_episode_across_all_seasons ---
-
-def get_available_seasons(driver):
-    """Best-effort: return a sorted list of season numbers (as strings) available in the season dropdown."""
-    seasons = set()
-
-    def _close_menu():
-        try:
-            driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
-            time.sleep(0.15)
-        except Exception:
-            pass
-
-    def _wait_listbox(timeout=3.0):
-        end = time.time() + timeout
-        last = None
-        while time.time() < end:
-            try:
-                lbs = driver.find_elements(By.XPATH, "//*[@role='listbox']")
-                lbs = [lb for lb in lbs if lb.is_displayed()]
-                if lbs:
-                    last = lbs[-1]
-                    return last
-            except Exception:
-                pass
-            time.sleep(0.05)
-        return last
-
-    # 1) Native <select> options
-    try:
-        dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
-        if dropdowns:
-            sel = Select(dropdowns[0])
-            for opt in sel.options:
-                v = normalize_season_value(opt.text) or normalize_season_value(opt.get_attribute('value'))
-                if v:
-                    seasons.add(v)
-            if seasons:
-                print_success(f"Found {len(seasons)} seasons via native <select>")
-                try:
-                    return [str(x) for x in sorted({int(s) for s in seasons})]
-                except Exception:
-                    return sorted(list(seasons))
-    except Exception:
-        pass
-
-    # 2) MUI/custom select: click the season dropdown, then ONLY read options inside the opened listbox
-    print_step("Opening season dropdown to enumerate available seasons...")
-
-    trigger = None
-    try:
-        trigger = driver.find_element(
-            By.XPATH,
-            "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[(self::div or self::button or self::span) and (@role='combobox' or @aria-haspopup='listbox' or contains(@class,'MuiSelect') or contains(@class,'MuiInputBase'))][1]"
-        )
-    except Exception:
-        trigger = None
-
-    if trigger is None:
-        try:
-            candidates = driver.find_elements(By.CSS_SELECTOR, ".MuiSelect-select, [role='combobox'], [aria-haspopup='listbox']")
-            for el in candidates:
-                try:
-                    if el.is_displayed():
-                        trigger = el
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            trigger = None
-
-    if not trigger:
-        print_warning("Could not find season dropdown trigger")
-        return []
-
-    try:
-        try:
-            driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", trigger)
-        except Exception:
-            pass
-        _click_el(driver, trigger)
-        time.sleep(0.25)
-
-        lb = _wait_listbox(timeout=3.0)
-        if not lb:
-            print_warning("Season dropdown opened but listbox not found")
-            _close_menu()
-            return []
-
-        options = []
-        try:
-            options = lb.find_elements(By.XPATH, ".//*[@role='option'] | .//li")
-        except Exception:
-            options = []
-
-        # Filter out junk: keep only values that parse to a sane season number
-        for el in options:
-            try:
-                txt = (el.text or '').strip()
-                v = normalize_season_value(txt)
-                if not v:
-                    continue
-                # Sanity bounds
-                try:
-                    iv = int(v)
-                    if iv < 0 or iv > 200:
-                        continue
-                except Exception:
-                    pass
-                seasons.add(v)
-            except Exception:
-                continue
-
-        _close_menu()
-
-        if seasons:
-            try:
-                sorted_seasons = [str(x) for x in sorted({int(s) for s in seasons})]
-            except Exception:
-                sorted_seasons = sorted(list(seasons))
-            print_success(f"Found {len(sorted_seasons)} seasons via dropdown: {', '.join(sorted_seasons)}")
-            return sorted_seasons
-
-        print_warning("Dropdown opened but no season options parsed")
-        return []
-
-    except Exception as e:
-        print_warning(f"Season dropdown enumeration failed: {e}")
-        _close_menu()
-        return []
-
-
-def find_episode_across_all_seasons(driver, wait, episode_title):
-    """Loop seasons and search within each season until the episode is found."""
-    if not _ensure_seasons_tab(driver, wait):
-        return "", "Failed to load Seasons & Episodes tab"
-
-    print_step("Search All Seasons active: will scan every season in the series...")
-    seasons = get_available_seasons(driver)
-    
-    if not seasons:
-        # Fallback: we can only scan the currently visible season
-        print_warning("Could not enumerate seasons. Scanning current season only.")
-        return find_episode_tms_id(driver, wait, episode_title, current_season=None)
-    
-    print_success(f"Will search through {len(seasons)} season(s): {', '.join(seasons)}")
-    print_step(f"Looking for episode: {episode_title}")
-
-    for s in seasons:
-        print_step(f"Selecting Season {s}...")
-
-        ok = select_season(driver, wait, s)
-        cur = _read_current_season_value(driver)
-        if not ok or (cur and cur != str(s)):
-            # One retry, MUI can drop the first click
-            print_warning(f"Season select did not stick (wanted {s}, read '{cur or ''}'). Retrying once...")
-            ok = select_season(driver, wait, s)
-            cur = _read_current_season_value(driver)
-
-        if not ok or (cur and cur != str(s)):
-            print_warning(f"Could not select season {s}; skipping")
-            continue
-
-        _wait_for_first_page(driver, timeout=4.0)
-        ep_id, note = find_episode_tms_id(driver, wait, episode_title, current_season=s)
-        if ep_id:
-            return ep_id, ""
-
-    return "", "Episode not found in any season - manual verification needed"
 
 def find_episode_tms_id(driver, wait, episode_title, current_season=None):
     print_step(f"Searching for episode: '{episode_title}'...")
@@ -1769,7 +1503,6 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
             except Exception:
                 pass
         return tms_id
-
     def forward_walk():
         """Scan current page, then walk forward through pages until visited loops or Next is unavailable."""
         visited = set()
@@ -1811,7 +1544,64 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None):
             steps += 1
         return None
 
+    def _get_season_candidates(max_fallback=30):
+        """Return an ordered list of season numbers (as strings) that appear selectable in the UI."""
+        # 1) Prefer native <select> options when available
+        try:
+            dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
+            if dropdowns:
+                sel = Select(dropdowns[0])
+                nums = []
+                for opt in sel.options:
+                    n = normalize_season_value(opt.text) or normalize_season_value(opt.get_attribute('value'))
+                    if n and n not in nums:
+                        nums.append(n)
+                if nums:
+                    return nums
+        except Exception:
+            pass
+
+        # 2) Fallback: probe a reasonable range and keep the ones that actually select
+        found = []
+        for i in range(1, max_fallback + 1):
+            s = str(i)
+            try:
+                if select_season(driver, wait, s):
+                    if s not in found:
+                        found.append(s)
+            except Exception:
+                continue
+        return found
+
+    def _search_all_seasons():
+        """Search for the episode across every season available."""
+        seasons = _get_season_candidates()
+        if not seasons:
+            print_warning("Could not determine seasons to scan; scanning current view only")
+            tms = forward_walk()
+            return tms
+
+        print_step(f"Ignoring season filter: scanning {len(seasons)} seasons ({', '.join(seasons)})")
+        for s in seasons:
+            print_step(f"Scanning Season {s}...")
+            if not select_season(driver, wait, s):
+                print_warning(f"Could not select season {s}; skipping")
+                continue
+            _wait_for_first_page(driver, timeout=4.0)
+            tms = forward_walk()
+            if tms:
+                return tms
+        return None
+      
     try:
+        # If no specific season is provided, scan all seasons
+        if current_season is None:
+            result = _search_all_seasons()
+            if result:
+                return result, ""
+            print_warning("Episode not found after scanning all seasons")
+            return "", "Episode not found - manual verification needed"
+
         # First forward pass
         result = forward_walk()
         if result:
@@ -2001,35 +1791,28 @@ def process_episode(driver, wait, episode, index, total, state, allow_defer=True
         else:
             print_step("Seasons & Episodes tab already open - skipping")
   
+        ignore_season = bool(CONFIG.get('ignore_season_search'))
 
-
-
-  
-        # --- START OF MODIFICATION ---
-        # Determine if we should skip season selection
-
-        skip_season_selection = (not allow_defer) and CONFIG.get('ignore_season_on_second_pass', False)
-        if skip_season_selection:
-            print_step("Search All Seasons active: will scan every season in the series...")
+        if ignore_season:
+            print_step("Ignore-season mode enabled: scanning entire series")
+            # Do not select a season; let the lookup scan all seasons
+            episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, None)
         else:
-            # Ensure correct season is selected (original logic)
+            # Select season only if it changed
             if state.get('current_season') != season:
-                print_step(f"Selecting season: {season}")
-                if select_season(driver, wait, season):
-                    state['current_season'] = season
-                    time.sleep(1)
-        # --- END OF MODIFICATION ---
-        
-        print_step(f"Looking for episode: {episode_title}")
-        if skip_season_selection:
-            episode_tms_id, note = find_episode_across_all_seasons(driver, wait, episode_title)
-        else:
+                if not select_season(driver, wait, season):
+                    episode['Notes'] = f"Failed to select season {season}"
+                    return
+                state['current_season'] = season
+                time.sleep(1.0)
+            else:
+                print_step(f"Season {season} already selected - skipping")
+
             episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, season)
+
         episode['EpisodeTMSID'] = episode_tms_id
         if note:
             episode['Notes'] = note
-        
-        
 
     except Exception as e:
         print_error(f"Error processing episode: {e}")
@@ -2042,6 +1825,9 @@ def main():
 
     # Prompt for run mode at start
     prompt_mode_choice()
+    prompt_ignore_season_choice()
+
+    
     
     print(f"\n📂 Reading input CSV file: {CONFIG['input_csv']}...")
     try:
