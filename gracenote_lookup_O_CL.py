@@ -1528,78 +1528,162 @@ def get_available_seasons(driver):
                     seasons.add(v)
             if seasons:
                 print_success(f"Found {len(seasons)} seasons via native <select>")
+                try:
+                    sorted_seasons = [str(x) for x in sorted({int(s) for s in seasons})]
+                    return sorted_seasons
+                except Exception:
+                    return sorted(list(seasons))
     except Exception:
         pass
 
-    # 2) Material UI style dropdown options (open and read listbox)
-    if not seasons:
+    # 2) Material UI style dropdown - try multiple approaches
+    print_step("Opening season dropdown to enumerate available seasons...")
+    
+    # Try to find the trigger element using multiple strategies
+    trigger = None
+    
+    # Strategy A: Look for input/div directly after "Season and Episode Summary"
+    try:
+        # The dropdown appears to be the first input or div with dropdown characteristics after the header
+        candidates = driver.find_elements(By.XPATH, 
+            "//*[contains(normalize-space(.), 'Season and Episode Summary')]/following::*[self::input or self::div][contains(@class, 'MuiInputBase') or contains(@class, 'MuiSelect') or @role='combobox' or @aria-haspopup='listbox'][1]")
+        if candidates and candidates[0].is_displayed():
+            trigger = candidates[0]
+            print_step("Found dropdown via Strategy A (following Season and Episode Summary)")
+    except Exception as e:
+        print_step(f"Strategy A failed: {e}")
+    
+    # Strategy B: Look for the dropdown near "Season and Episode Summary"
+    if not trigger:
         try:
-            print_step("Opening season dropdown to enumerate available seasons...")
-            anchor = None
-            try:
-                anchor = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Season and Episode Summary')]")
-            except Exception:
-                anchor = None
-
-            scopes = [anchor, driver] if anchor is not None else [driver]
-
-            trigger = None
-            for scope in scopes:
+            anchor = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Season and Episode Summary')]")
+            # Scroll it into view
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", anchor)
+            time.sleep(0.5)
+            
+            # Look for dropdown controls near this anchor
+            candidates = anchor.find_elements(By.XPATH, "./following::*[(self::div or self::button) and (@role='combobox' or @aria-haspopup='listbox' or contains(@class, 'MuiSelect'))][1]")
+            if candidates:
+                trigger = candidates[0]
+                print_step("Found dropdown via Strategy B (near Season and Episode Summary)")
+        except Exception as e:
+            print_step(f"Strategy B failed: {e}")
+    
+    # Strategy C: Look for any visible combobox/select on the page
+    if not trigger:
+        try:
+            candidates = driver.find_elements(By.CSS_SELECTOR, ".MuiSelect-select, [role='combobox'], [aria-haspopup='listbox']")
+            for el in candidates:
                 try:
-                    cands = scope.find_elements(By.CSS_SELECTOR, ".MuiSelect-select, .MuiInputBase-root [aria-haspopup='listbox'], [role='combobox'], [aria-haspopup='listbox']")
+                    if el.is_displayed() and 'season' in (el.text or '').lower():
+                        trigger = el
+                        print_step("Found dropdown via Strategy C (visible season text)")
+                        break
                 except Exception:
-                    cands = []
-                for el in cands:
+                    continue
+        except Exception as e:
+            print_step(f"Strategy C failed: {e}")
+    
+    # Strategy D: Look for elements that display "Season X" with dropdown attributes
+    if not trigger:
+        try:
+            candidates = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.), 'Season ') and (self::div or self::button or self::span)][@aria-haspopup='listbox' or @role='combobox']")
+            if candidates:
+                for el in candidates:
                     try:
                         if el.is_displayed():
                             trigger = el
+                            print_step("Found dropdown via Strategy D (Season with dropdown attributes)")
                             break
                     except Exception:
                         continue
-                if trigger:
-                    break
-
-            if trigger:
-                _click_el(driver, trigger)
-                time.sleep(0.5)  # Give dropdown time to fully render
-                
-                # Look for all season options in the dropdown
-                options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
-                
-                for el in options:
-                    try:
-                        txt = (el.text or '').strip()
-                        v = normalize_season_value(txt)
-                        if v:
-                            seasons.add(v)
-                    except Exception:
-                        continue
-                
-                # Close menu (ESC)
-                try:
-                    driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
-                    time.sleep(0.3)
-                except Exception:
-                    pass
-                
-                if seasons:
-                    print_success(f"Found {len(seasons)} seasons via Material UI dropdown: {sorted(list(seasons), key=lambda x: int(x))}")
         except Exception as e:
-            print_warning(f"Material UI dropdown enumeration failed: {e}")
-
-    # 3) REMOVED brute-force fallback that was trying seasons 1-30
-    # This approach was inefficient and caused the error messages in the output
-    # If we can't enumerate seasons via the dropdown, we'll fall back to scanning current season only
-
-    # Sort numerically
-    if seasons:
+            print_step(f"Strategy D failed: {e}")
+    
+    # Strategy E: Look for any MuiInputBase or MuiSelect after scrolling to ensure it's in view
+    if not trigger:
         try:
-            sorted_seasons = [str(x) for x in sorted({int(s) for s in seasons})]
-            return sorted_seasons
-        except Exception:
-            return sorted(list(seasons))
-    else:
+            # Find the section containing Season and Episode Summary
+            section = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Season and Episode Summary')]/ancestor::section")
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'start'});", section)
+            time.sleep(0.5)
+            
+            # Now look for any selects within that section
+            candidates = section.find_elements(By.XPATH, ".//*[contains(@class, 'MuiInputBase') or contains(@class, 'MuiSelect') or @role='combobox']")
+            for el in candidates:
+                try:
+                    if el.is_displayed():
+                        trigger = el
+                        print_step("Found dropdown via Strategy E (within section)")
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            print_step(f"Strategy E failed: {e}")
+
+    if not trigger:
+        print_warning("Could not find season dropdown trigger after trying all strategies")
         return []
+
+    # Click the trigger to open the dropdown
+    try:
+        print_step(f"Attempting to click dropdown trigger: {trigger.tag_name}")
+        # Scroll into view and click
+        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", trigger)
+        time.sleep(0.3)
+        _click_el(driver, trigger)
+        time.sleep(0.7)  # Give dropdown time to fully render
+        
+        # Look for all season options in the dropdown
+        options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
+        
+        if not options:
+            # Fallback: look for any list items visible after clicking
+            print_step("Trying fallback option selector...")
+            options = driver.find_elements(By.XPATH, "//ul[contains(@class, 'MuiMenu-list') or contains(@class, 'MuiList')]//li")
+        
+        print_step(f"Found {len(options)} dropdown options to examine")
+        
+        for el in options:
+            try:
+                txt = (el.text or '').strip()
+                if txt:  # Only process non-empty text
+                    v = normalize_season_value(txt)
+                    if v:
+                        seasons.add(v)
+                        print_step(f"  - Found season: {txt} -> {v}")
+            except Exception as e:
+                print_step(f"  - Error reading option: {e}")
+                continue
+        
+        # Close menu (ESC or click away)
+        try:
+            driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+            time.sleep(0.3)
+        except Exception:
+            try:
+                # Click somewhere neutral to close
+                driver.find_element(By.TAG_NAME, 'body').click()
+                time.sleep(0.3)
+            except Exception:
+                pass
+        
+        if seasons:
+            print_success(f"Found {len(seasons)} seasons via Material UI dropdown: {sorted(list(seasons), key=lambda x: int(x))}")
+            try:
+                sorted_seasons = [str(x) for x in sorted({int(s) for s in seasons})]
+                return sorted_seasons
+            except Exception:
+                return sorted(list(seasons))
+        else:
+            print_warning("Dropdown opened but no season options found")
+            
+    except Exception as e:
+        print_warning(f"Material UI dropdown enumeration failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    return []
 
 
 def find_episode_across_all_seasons(driver, wait, episode_title):
