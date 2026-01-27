@@ -1445,6 +1445,86 @@ def select_season(driver, wait, season_number):
     print_warning(f"Could not select season {desired}")
     return False
 
+
+# --- New helpers: get_available_seasons and find_episode_across_all_seasons ---
+
+def get_available_seasons(driver):
+    """Best-effort: return a sorted list of season numbers (as strings) available in the season dropdown."""
+    seasons = set()
+
+    # 1) Native <select> options
+    try:
+        dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
+        if dropdowns:
+            sel = Select(dropdowns[0])
+            for opt in sel.options:
+                v = normalize_season_value(opt.text) or normalize_season_value(opt.get_attribute('value'))
+                if v:
+                    seasons.add(v)
+    except Exception:
+        pass
+
+    # 2) Material UI style dropdown options (open and read listbox)
+    if not seasons:
+        try:
+            # Try to find a trigger that looks like a season picker
+            trigger = None
+            triggers = driver.find_elements(By.XPATH,
+                "//*[self::div or self::button or self::span][(contains(@role,'button') or @role='combobox' or contains(@class,'select') or contains(@class,'MuiSelect')) and contains(normalize-space(.), 'Season')]")
+            if triggers:
+                trigger = triggers[0]
+            else:
+                triggers = driver.find_elements(By.XPATH,
+                    "//*[contains(., 'Season and Episode Summary')]/following::*[(self::div or self::button) and (contains(@role,'button') or contains(@class,'select') or contains(@class,'MuiSelect'))][1]")
+                if triggers:
+                    trigger = triggers[0]
+
+            if trigger:
+                _click_el(driver, trigger)
+                time.sleep(0.3)
+                options = driver.find_elements(By.XPATH, "//*[@role='listbox']//*[@role='option'] | //ul[@role='listbox']//li | //div[@role='listbox']//li | //li[contains(@class,'MuiMenuItem')]")
+                for el in options:
+                    txt = (el.text or '').strip()
+                    v = normalize_season_value(txt)
+                    if v:
+                        seasons.add(v)
+                # Close menu (ESC)
+                try:
+                    driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Sort numerically
+    try:
+        return [str(x) for x in sorted({int(s) for s in seasons})]
+    except Exception:
+        return sorted(list(seasons))
+
+
+def find_episode_across_all_seasons(driver, wait, episode_title):
+    """Loop seasons and search within each season until the episode is found."""
+    if not _ensure_seasons_tab(driver, wait):
+        return "", "Failed to load Seasons & Episodes tab"
+
+    seasons = get_available_seasons(driver)
+    if not seasons:
+        # Fallback: we can only scan the currently visible season
+        print_warning("Could not enumerate seasons. Scanning current season only.")
+        return find_episode_tms_id(driver, wait, episode_title, current_season=None)
+
+    for s in seasons:
+        print_step(f"Search All Seasons: selecting Season {s}")
+        if not select_season(driver, wait, s):
+            continue
+        _wait_for_first_page(driver, timeout=4.0)
+        ep_id, note = find_episode_tms_id(driver, wait, episode_title, current_season=s)
+        if ep_id:
+            return ep_id, ""
+
+    return "", "Episode not found in any season - manual verification needed"
+
 def find_episode_tms_id(driver, wait, episode_title, current_season=None):
     print_step(f"Searching for episode: '{episode_title}'...")
     
@@ -1732,18 +1812,21 @@ def process_episode(driver, wait, episode, index, total, state, allow_defer=True
 
         skip_season_selection = (not allow_defer) and CONFIG.get('ignore_season_on_second_pass', False)
         if skip_season_selection:
-            print_step("Search All Seasons active: Scanning current view without switching seasons...")
+            print_step("Search All Seasons active: will scan every season in the series...")
         else:
-        # Ensure correct season is selected (Original Logic)
+            # Ensure correct season is selected (original logic)
             if state.get('current_season') != season:
                 print_step(f"Selecting season: {season}")
-                if select_season_mui(driver, wait, season):
+                if select_season(driver, wait, season):
                     state['current_season'] = season
                     time.sleep(1)
         # --- END OF MODIFICATION ---
         
         print_step(f"Looking for episode: {episode_title}")
-        episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, season)
+        if skip_season_selection:
+            episode_tms_id, note = find_episode_across_all_seasons(driver, wait, episode_title)
+        else:
+            episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, season)
         episode['EpisodeTMSID'] = episode_tms_id
         if note:
             episode['Notes'] = note
