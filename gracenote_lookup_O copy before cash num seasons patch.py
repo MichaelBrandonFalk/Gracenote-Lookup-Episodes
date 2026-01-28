@@ -1553,7 +1553,7 @@ def select_season(driver, wait, season_number):
     print_warning(f"Could not select season {desired}")
     return False
 
-def find_episode_tms_id(driver, wait, episode_title, current_season=None, state=None, series_key=None):
+def find_episode_tms_id(driver, wait, episode_title, current_season=None):
     print_step(f"Searching for episode: '{episode_title}'...")
     
     if not episode_title or episode_title.strip() == '':
@@ -1642,15 +1642,6 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None, state=
 
     def _get_season_candidates(max_fallback=30):
         """Return an ordered list of season numbers (as strings) that appear selectable in the UI."""
-        # If we already discovered seasons for this series in this run, reuse them
-        try:
-            if state is not None and series_key:
-                cache = state.setdefault('season_candidates_cache', {})
-                cached = cache.get(series_key)
-                if isinstance(cached, list) and cached:
-                    return cached
-        except Exception:
-            pass
         # 1) Prefer native <select> options when available
         try:
             dropdowns = driver.find_elements(By.XPATH, "//section//*[self::select] | //*[contains(., 'Season and Episode Summary')]/following::select[1] | //select")
@@ -1684,11 +1675,6 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None, state=
                         if n and n not in nums:
                             nums.append(n)
                     if nums:
-                        try:
-                            if state is not None and series_key:
-                                state.setdefault('season_candidates_cache', {})[series_key] = nums
-                        except Exception:
-                            pass
                         return nums
         except Exception:
             pass
@@ -1722,11 +1708,6 @@ def find_episode_tms_id(driver, wait, episode_title, current_season=None, state=
             if select_season(driver, wait, 'No Season'):
                 if 'No Season' not in found:
                     found.append('No Season')
-        except Exception:
-            pass
-        try:
-            if state is not None and series_key and found:
-                state.setdefault('season_candidates_cache', {})[series_key] = found
         except Exception:
             pass
         return found
@@ -1954,7 +1935,7 @@ def process_episode(driver, wait, episode, index, total, state, allow_defer=True
         if ignore_season:
             print_step("Ignore-season mode enabled: scanning entire series")
             # Do not select a season; let the lookup scan all seasons
-            episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, None, state=state, series_key=series_key)
+            episode_tms_id, note = find_episode_tms_id(driver, wait, episode_title, None)
         else:
             # Select season only if it changed
             if state.get('current_season') != season:
