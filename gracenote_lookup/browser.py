@@ -63,7 +63,7 @@ class GracenoteBrowser:
         def entry(driver):
             if self.signed_in() or urlparse(driver.current_url).hostname == LOGIN_HOST:
                 return True
-            links = driver.find_elements(By.CSS_SELECTOR, 'a[href^="/login"]')
+            links = driver.find_elements(By.CSS_SELECTOR, 'a[href^="/login"],a[href^="https://gracenoteview.com/login"]')
             return next((link for link in links if link.is_displayed() and link.is_enabled()), False)
         result = self.wait(entry, 'Gracenote did not show its Login link')
         if result is not True:
