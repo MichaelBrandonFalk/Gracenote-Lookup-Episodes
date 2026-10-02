@@ -1,6 +1,6 @@
 """Site controls verified against Gracenote View on 2026-10-02."""
 import re
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
 from selenium.webdriver.common.by import By
@@ -13,6 +13,12 @@ from .pagination import collect_pages, snapshot, wait_ready, PaginationError
 from .runtime import runtime
 
 BASE_URL = "https://gracenoteview.com"
+LOGIN_HOST = 'gnview-login-prod.auth.us-west-2.amazoncognito.com'
+LOGIN_CLIENT = '6fge98mj5sp83lf6ej07mkrhfu'
+
+
+class SignInError(Exception):
+    pass
 
 
 class GracenoteBrowser:
@@ -37,6 +43,94 @@ class GracenoteBrowser:
             return ""
         return extract_tms_id(parsed.path, prefix) or ""
 
+    def programs_link(self):
+        if urlparse(self.driver.current_url).hostname != 'gracenoteview.com':
+            return None
+        links = self.driver.find_elements(By.CSS_SELECTOR, 'a[href="/programs"],a[href="https://gracenoteview.com/programs"]')
+        return next((link for link in links if link.is_displayed() and link.is_enabled()), None)
+
+    def signed_in(self):
+        try:
+            if urlparse(self.driver.current_url).path == '/auth-forbidden':
+                raise SignInError('Gracenote rejected this session. Another browser login may have invalidated it, '
+                                  'or the account may lack access. Clear this run and sign in again.')
+            return self.programs_link() is not None
+        except (NoSuchElementException, StaleElementReferenceException):
+            return False
+
+    def start_sign_in(self):
+        # Use the site's own Login link, preserving its supported redirect.
+        def entry(driver):
+            if self.signed_in() or urlparse(driver.current_url).hostname == LOGIN_HOST:
+                return True
+            links = driver.find_elements(By.CSS_SELECTOR, 'a[href^="/login"],a[href^="https://gracenoteview.com/login"]')
+            return next((link for link in links if link.is_displayed() and link.is_enabled()), False)
+        result = self.wait(entry, 'Gracenote did not show its Login link')
+        if result is not True:
+            result.click()
+
+    def fill_saved_sign_in(self, username, password):
+        # Never send credentials to arbitrary pages, redirects or SSO providers.
+        def trusted_form(driver):
+            url = urlparse(driver.current_url)
+            query = parse_qs(url.query)
+            if (url.scheme != 'https' or url.hostname != LOGIN_HOST or url.path != '/login'
+                    or query.get('client_id') != [LOGIN_CLIENT]
+                    or query.get('redirect_uri') != [BASE_URL + '/login']):
+                raise SignInError('Open Gracenote’s email/password sign-in page before filling saved credentials.')
+            users = [el for el in driver.find_elements(By.CSS_SELECTOR, 'input[name="username"]') if el.is_displayed() and el.is_enabled()]
+            passwords = [el for el in driver.find_elements(By.CSS_SELECTOR, 'input[name="password"][type="password"]') if el.is_displayed() and el.is_enabled()]
+            return (users[0], passwords[0]) if len(users) == len(passwords) == 1 else False
+        user_field, password_field = self.wait(trusted_form, 'The visible Gracenote sign-in fields did not appear')
+        user_field.clear()
+        user_field.send_keys(username)
+        password_field.clear()
+        password_field.send_keys(password)
+        # The user submits Sign in, including any MFA or corporate SSO steps.
+
+    def open_programs(self):
+        selector = "input[placeholder='Enter Program by Name']"
+        visible_search = [el for el in self.driver.find_elements(By.CSS_SELECTOR, selector) if el.is_displayed()]
+        if not visible_search:
+            link = self.wait(lambda d: self.programs_link(), 'The signed-in Programs link did not appear')
+            link.click()
+        # A previous manual search may have left TMS ID mode selected.
+        def title_mode(driver):
+            modes = driver.find_elements(By.XPATH,
+                "//*[self::label or self::button][normalize-space(.)='Program Title']")
+            return next((mode for mode in modes if mode.is_displayed() and mode.is_enabled()), None)
+        self.wait(title_mode, 'Programs did not show the Program Title search mode').click()
+        return self.wait(lambda d: EC.element_to_be_clickable((By.CSS_SELECTOR, selector))(d),
+                         'Programs did not open after clicking the sidebar link')
+
+    def configure_type_filters(self, prefix):
+        # Movie rows must retain Film AND TV Movie results. Toggle off any
+        # checked filter left behind by a manual selection or previous search.
+        script = r"""
+const types = new Set(['FILM','SERIES','PAID PROGRAMMING','SPECIAL','SPORTS','TV MOVIE']);
+const controls = [];
+for (const el of document.querySelectorAll('label,button,[role="button"],span')) {
+  if (!types.has(el.textContent.trim().toUpperCase()) || !el.getClientRects().length) continue;
+  if (el.closest('[role="option"],.program-typeahead-container,.gnview-program-card')) continue;
+  const root = el.closest('label,button,[role="button"]') || el;
+  if (controls.some(c=>c.element===root)) continue;
+  const inputs = [...root.querySelectorAll('input[type="checkbox"],input[type="radio"]')];
+  if (root.matches('label[for]')) {
+    const input = document.getElementById(root.htmlFor);
+    if (input) inputs.push(input);
+  }
+  const selected = inputs.some(i=>i.checked) || root.getAttribute('aria-pressed')==='true' ||
+    root.getAttribute('aria-checked')==='true' || root.getAttribute('data-state')==='checked' ||
+    /(?:^|\s)(?:active|selected|Mui-selected)(?:\s|$)/.test(root.className || '');
+  controls.push({element:root,selected,name:el.textContent.trim().toUpperCase()});
+}
+return controls;
+"""
+        for control in self.driver.execute_script(script):
+            desired = prefix == 'SH' and control['name'] == 'SERIES'
+            if bool(control['selected']) != desired:
+                control['element'].click()
+
     def verify_series(self, title, expected_id=None):
         def confirmed(driver):
             identifier = self.selected_id()
@@ -49,11 +143,15 @@ class GracenoteBrowser:
         return self.selected_id()
 
     def search(self, title, prefix='SH', year=''):
-        self.driver.get(BASE_URL + "/programs")
-        search = self.wait(lambda d: EC.element_to_be_clickable((By.CSS_SELECTOR, "input[placeholder='Enter Program by Name']"))(d))
+        search = self.open_programs()
+        self.configure_type_filters(prefix)
+        # Movies remain unfiltered so Film AND TV Movie results are returned.
         search.click()
         search.send_keys(Keys.COMMAND if __import__('sys').platform == 'darwin' else Keys.CONTROL, "a")
         search.send_keys(Keys.BACKSPACE)
+        self.wait(lambda d: not any(o.is_displayed() and o.find_elements(By.CSS_SELECTOR, '.program-tmsid')
+                                   for o in d.find_elements(By.CSS_SELECTOR, "[role='listbox'] [role='option']")),
+                  'Previous title suggestions did not clear')
         search.send_keys(title)
 
         def results(driver):

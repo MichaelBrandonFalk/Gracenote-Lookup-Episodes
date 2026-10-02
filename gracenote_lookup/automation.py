@@ -12,6 +12,7 @@ from .matching import (canonicalize_title_for_match, extract_tms_id, group_key,
                        _value_is_one, _value_means_done)
 from .pagination import match_episode, PaginationError
 from .runtime import runtime, RunCancelled
+from .sign_in import finish_sign_in
 
 DEFAULTS = {
     'input_csv': 'InputEpisodes.csv',
@@ -130,8 +131,7 @@ def main(config=None, browser_factory=None):
                 driver.set_page_load_timeout(60)
                 browser = GracenoteBrowser(driver, settings['wait_timeout'])
                 driver.get(BASE_URL)
-                runtime.ask('Sign in to Gracenote in Chrome, then click Continue in this app.')
-                runtime.check()
+                finish_sign_in(browser)
             for key, rows in groups.items():
                 if settings['second_pass_only'] or not process_group(browser, key, rows, False):
                     deferred.append((key, rows))
