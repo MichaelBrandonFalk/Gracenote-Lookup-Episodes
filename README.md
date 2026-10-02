@@ -13,13 +13,22 @@ The current app is ad-hoc signed, not Apple notarized. macOS may ask you to allo
 
 ## Use the app
 
-1. Download the ZIP, unzip it, and open **Gracenote Episode Lookup v2.0.0.app**.
+1. Download the ZIP, unzip it, and open **Gracenote Episode Lookup v2.0.1.app**.
 2. Choose an avails `.xlsx` workbook or episode `.csv` and a different output location of the same file type.
-3. Click **Start lookup**, sign in directly in Chrome, then click **Continue** in the app.
+3. Click **Start lookup** and sign in in Chrome. The app detects successful sign-in and clicks **Programs** automatically, even if Gracenote lands on Schedules.
 4. When multiple programs share a title, select the correct movie or series in Chrome and continue, or skip it.
 5. Review the results table and open the output. XLSX runs also create a separate review CSV. **Stop and save** retains completed results.
+6. Click **Clear** to remove the selected files, results and activity and start over. If a lookup is running, it stops and saves before clearing. Saved files are retained.
 
 The normal mode makes an automatic pass, then asks for series choices in a second pass. Manual mode asks for every series that has no supplied ID. **Search every season** scans all available seasons, including No Season when offered.
+
+## Local sign-in settings
+
+Open **Settings** to save your Gracenote username and password in this Mac’s Keychain, or remove saved credentials. They are not written to application files, logs, workbooks, source control or GitHub releases. **Clear** retains saved credentials.
+
+During sign-in, **Fill saved sign-in** fills the verified Gracenote email/password form. You click **Sign in** in Chrome and complete any MFA. Copy buttons are also available in Settings. Corporate and Google sign-in remain manual. The app waits for the signed-in Programs navigation before continuing, and reports an invalidated Gracenote session rather than waiting indefinitely.
+
+Movie searches leave program-type filters off so both Film and TV Movie results remain available. Result IDs and program badges are verified before any workbook cell is filled.
 
 ## Avails Excel workbooks
 

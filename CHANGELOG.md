@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.1 — 2026-10-02
+
+- Detect successful Chrome sign-in automatically and click the Programs sidebar link, including when Gracenote lands on Schedules. Remove the desktop login Continue requirement.
+- Add Settings to save username/password locally in macOS Keychain, fill the verified Gracenote sign-in form on request, copy details for browser sign-in, or remove them. No credentials are written to files, logs, exports or releases.
+- Explicitly select Program Title mode, clear previous type filters and stale suggestions, and retain both Film and TV Movie results for movie searches.
+- Add Clear to reset selected files, results, filters and activity without closing the app. During a lookup, Clear stops and saves before resetting; saved files are retained.
+- Give all checkboxes larger, explicit indicators: white with a dark outline when unchecked, green with a white checkmark when checked. Keep checked states visible when controls are disabled.
+- Verify Clear in the packaged-app startup check and include the checkmark asset in every app build.
+
 ## 2.0.0 — 2026-10-02
 
 - Add a desktop UI with XLSX/CSV pickers, progress, results, review filtering, and Continue/Skip buttons.

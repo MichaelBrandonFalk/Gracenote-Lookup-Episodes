@@ -28,6 +28,7 @@ class LookupWorker(QThread):
     result = Signal(object)
     failed = Signal(str)
     stopped = Signal()
+    login_complete = Signal()
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -35,6 +36,7 @@ class LookupWorker(QThread):
         self.reply_ready = Event()
         self.stop_requested = Event()
         self.answer = ""
+        self.fill_requested = Event()
 
     def respond(self, answer=""):
         self.answer = answer
@@ -58,6 +60,7 @@ class LookupWorker(QThread):
         runtime.ask = self.ask
         runtime.progress = self.progress.emit
         runtime.rows = lambda rows: self.rows.emit(deepcopy(rows))
+        runtime.await_login = self.await_login
         try:
             from .automation import main
             self.result.emit(main(self.config))
@@ -71,6 +74,32 @@ class LookupWorker(QThread):
             runtime.ask = lambda text: ""
             runtime.progress = lambda current, total: None
             runtime.rows = lambda rows: None
+            runtime.await_login = None
+
+    def await_login(self, browser):
+        self.prompt.emit('Sign in to Gracenote in Chrome. The app continues automatically once you are signed in. '
+                         'Use Fill saved sign-in to fill local credentials, then click Sign in in Chrome.')
+        while True:
+            runtime.check()
+            if browser.signed_in():
+                runtime.check()
+                self.login_complete.emit()
+                return
+            if self.fill_requested.is_set():
+                self.fill_requested.clear()
+                try:
+                    from .credentials import CredentialStore
+                    saved = CredentialStore().load()
+                    if saved is None:
+                        self.message.emit('No saved credentials. Open Settings to save them on this Mac.')
+                    else:
+                        browser.fill_saved_sign_in(saved['username'], saved['password'])
+                        self.message.emit('Saved sign-in details filled. Click Sign in in Chrome.')
+                except Exception:
+                    # Keychain and navigation failures are safe to report;
+                    # never log a driver exception from typing a password.
+                    self.message.emit('Could not fill saved sign-in. Check Settings and open Gracenote’s sign-in form, or sign in manually.')
+            self.stop_requested.wait(0.3)
 
 
 class MainWindow(QMainWindow):
@@ -80,6 +109,7 @@ class MainWindow(QMainWindow):
         self.resize(1140, 820)
         self.worker = None
         self.close_after_stop = False
+        self.clear_after_stop = False
         self.output_path = None
         self.all_rows = []
         root = QWidget()
@@ -95,6 +125,9 @@ class MainWindow(QMainWindow):
         version = QLabel(f"v{__version__}  /  macOS")
         version.setObjectName("muted")
         heading.addWidget(version)
+        self.settings_button = QPushButton('Settings')
+        self.settings_button.clicked.connect(self.open_settings)
+        heading.addWidget(self.settings_button)
         layout.addLayout(heading)
         subtitle = QLabel("Choose an avails workbook or episode CSV, sign in to Gracenote, and review the results here.")
         subtitle.setObjectName("muted")
@@ -151,6 +184,9 @@ class MainWindow(QMainWindow):
         self.stop = QPushButton("Stop and save")
         self.stop.setEnabled(False)
         self.stop.clicked.connect(self.stop_lookup)
+        self.clear = QPushButton("Clear")
+        self.clear.setToolTip("Clear selected files, results and activity. Saved files are kept.")
+        self.clear.clicked.connect(self.clear_lookup)
         self.open_output = QPushButton("Open results")
         self.open_output.setEnabled(False)
         self.open_output.clicked.connect(self.open_results)
@@ -159,6 +195,7 @@ class MainWindow(QMainWindow):
         self.open_report.clicked.connect(self.open_review_report)
         actions.addWidget(self.start)
         actions.addWidget(self.stop)
+        actions.addWidget(self.clear)
         actions.addStretch()
         actions.addWidget(self.open_output)
         actions.addWidget(self.open_report)
@@ -185,8 +222,12 @@ class MainWindow(QMainWindow):
         self.continue_button.clicked.connect(lambda: self.respond(""))
         self.skip_button = QPushButton("Skip this program")
         self.skip_button.clicked.connect(lambda: self.respond("skip"))
+        self.fill_sign_in_button = QPushButton('Fill saved sign-in')
+        self.fill_sign_in_button.clicked.connect(self.fill_saved_sign_in)
         prompt_layout.addWidget(self.continue_button)
         prompt_layout.addWidget(self.skip_button)
+        prompt_layout.addWidget(self.fill_sign_in_button)
+        self.fill_sign_in_button.hide()
         self.prompt_panel.hide()
         layout.addWidget(self.prompt_panel)
 
@@ -269,6 +310,7 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.deleteLater()
         self.output_path = target
+        self.clear_after_stop = False
         self.log.clear()
         self.status.setText("Starting lookup · opening Chrome…")
         self.settings.setEnabled(False)
@@ -285,6 +327,7 @@ class MainWindow(QMainWindow):
         }, self)
         self.worker.message.connect(self.log.appendPlainText)
         self.worker.prompt.connect(self.show_prompt)
+        self.worker.login_complete.connect(self.login_finished)
         self.worker.progress.connect(self.update_progress)
         self.worker.rows.connect(self.update_rows)
         self.worker.result.connect(self.completed)
@@ -298,8 +341,28 @@ class MainWindow(QMainWindow):
             return
         self.prompt_text.setText(text.replace("press ENTER here", "click Continue").replace("press ENTER", "click Continue"))
         self.skip_button.setVisible("skip" in text.lower())
+        automatic_login = text.startswith('Sign in to Gracenote in Chrome. The app continues automatically')
+        self.continue_button.setVisible(not automatic_login)
+        self.fill_sign_in_button.setVisible(automatic_login)
         self.prompt_panel.show()
-        self.status.setText("Waiting for you · complete the browser step, then continue here.")
+        self.status.setText('Waiting for sign-in · Programs opens automatically when you finish.' if automatic_login
+                            else 'Waiting for you · complete the browser step, then continue here.')
+
+    def login_finished(self):
+        self.prompt_panel.hide()
+        self.status.setText('Signed in · opening Programs…')
+
+    def fill_saved_sign_in(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.fill_requested.set()
+
+    def open_settings(self):
+        from .settings import SettingsDialog
+        dialog = SettingsDialog(self)
+        dialog.exec()
+        dialog.password.clear()
+        dialog.username.clear()
+        dialog.deleteLater()
 
     def respond(self, text):
         if self.worker:
@@ -313,6 +376,39 @@ class MainWindow(QMainWindow):
             self.stop.setEnabled(False)
             self.prompt_panel.hide()
             self.status.setText("Stopping and saving · waiting for the current browser operation…")
+
+    def clear_lookup(self):
+        if self.worker and self.worker.isRunning():
+            self.clear_after_stop = True
+            self.clear.setEnabled(False)
+            self.stop_lookup()
+            self.status.setText("Stopping and saving · selected files and results will then be cleared.")
+            return
+        if self.worker:
+            self.worker.deleteLater()
+            self.worker = None
+        self.clear_after_stop = False
+        self.input.clear()
+        self.output.clear()
+        self.output_path = None
+        self.mode.setCurrentIndex(0)
+        self.ignore_season.setChecked(False)
+        self.resume.setChecked(True)
+        self.review_only.setChecked(False)
+        self.update_rows([])
+        self.row_count.setText("Results · no file selected")
+        self.log.clear()
+        self.prompt_text.clear()
+        self.prompt_panel.hide()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.settings.setEnabled(True)
+        self.start.setEnabled(True)
+        self.stop.setEnabled(False)
+        self.clear.setEnabled(True)
+        self.open_output.setEnabled(False)
+        self.open_report.setEnabled(False)
+        self.status.setText("Ready · choose an avails workbook or episode CSV to start over.")
 
     def update_progress(self, current, total):
         self.progress.setRange(0, max(total, 1))
@@ -370,6 +466,8 @@ class MainWindow(QMainWindow):
         self.open_report.setEnabled(bool(report and report.exists()))
         if self.close_after_stop:
             self.close()
+        elif self.clear_after_stop:
+            self.clear_lookup()
 
     def open_results(self):
         if self.output_path and self.output_path.exists():
@@ -404,7 +502,7 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet("""
         QWidget { font-family: '.AppleSystemUIFont', 'Segoe UI', sans-serif; font-size: 13px; color: #20362f; }
-        QMainWindow, QWidget#central { background: #f5f7f5; }
+        QMainWindow, QDialog, QWidget#central { background: #f5f7f5; }
         QLabel#title { font-size: 26px; font-weight: 700; }
         QLabel#muted { color: #66756e; font-size: 12px; }
         QLabel#section { font-weight: 600; }
@@ -420,7 +518,16 @@ def main():
         QHeaderView::section { background: #eef3ef; border: 0; border-right: 1px solid #dce4de; padding: 8px; font-weight: 600; }
         QProgressBar { border: 0; background: #e0e8e0; border-radius: 4px; }
         QProgressBar::chunk { background: #21664d; border-radius: 4px; }
-    """)
+        QCheckBox { spacing: 8px; padding: 3px; border: 1px solid transparent; border-radius: 5px; }
+        QCheckBox:focus { border-color: #21664d; }
+        QCheckBox:disabled { color: #6b7770; }
+        QCheckBox::indicator { width: 20px; height: 20px; border-radius: 4px; }
+        QCheckBox::indicator:unchecked { background: #ffffff; border: 2px solid #66756e; image: none; }
+        QCheckBox::indicator:checked { background: #21664d; border: 2px solid #21664d; image: url("@CHECKMARK@"); }
+        QCheckBox::indicator:unchecked:hover { border-color: #21664d; }
+        QCheckBox::indicator:unchecked:disabled { background: #edf0ed; border-color: #93a098; }
+        QCheckBox::indicator:checked:disabled { background: #66756e; border-color: #66756e; }
+    """.replace('@CHECKMARK@', (Path(__file__).parent / 'assets' / 'checkmark.svg').as_posix()))
     window = MainWindow()
     window.centralWidget().setObjectName("central")
     window.show()
@@ -453,7 +560,51 @@ def main():
                     path = Path(sys.argv[index + 1]).resolve()
                     path.parent.mkdir(parents=True, exist_ok=True)
                     assert window.grab().save(str(path))
-                print(f'Packaged UI, CSV and XLSX worker checks passed · v{__version__}')
+                # Exercise Clear on a completed run with real saved files.
+                saved_bytes = output.with_suffix('.xlsx').read_bytes()
+                window.review_only.setChecked(True)
+                window.ignore_season.setChecked(True)
+                window.mode.setCurrentIndex(1)
+                window.clear.click()
+                assert not window.input.text() and not window.output.text()
+                assert not window.all_rows and window.table.rowCount() == 0
+                assert window.output_path is None and window.worker is None
+                assert not window.open_output.isEnabled() and not window.open_report.isEnabled()
+                assert not window.review_only.isChecked() and not window.ignore_season.isChecked()
+                assert window.resume.isChecked() and window.mode.currentIndex() == 0
+                assert window.progress.value() == 0 and not window.log.toPlainText()
+                assert output.with_suffix('.xlsx').read_bytes() == saved_bytes
+                if index + 1 < len(sys.argv):
+                    assert window.grab().save(str(path.with_name(path.stem + '_cleared.png')))
+                # Verify the bundled native backend is importable without
+                # reading or writing any real Keychain item.
+                if sys.platform == 'darwin':
+                    from keyring.backends.macOS import Keyring
+                    assert Keyring.priority > 0
+                from .credentials import CredentialStore
+                from .self_test import MemoryKeychain
+                from .settings import SettingsDialog
+                vault = MemoryKeychain()
+                store = CredentialStore(vault)
+                dialog = SettingsDialog(window, store)
+                dialog.username.setText('example@example.com')
+                dialog.password.setText('synthetic-test-password')
+                dialog.save()
+                assert store.load()['username'] == 'example@example.com'
+                dialog.password.clear()
+                dialog.deleteLater()
+                loaded = SettingsDialog(window, store)
+                assert loaded.password.echoMode() == QLineEdit.EchoMode.Password
+                assert loaded.password.text() == 'synthetic-test-password'
+                loaded.show()
+                app.processEvents()
+                if index + 1 < len(sys.argv):
+                    assert loaded.grab().save(str(path.with_name(path.stem + '_settings.png')))
+                loaded.remove_saved()
+                assert store.load() is None and not loaded.password.text()
+                loaded.close()
+                loaded.deleteLater()
+                print(f'Packaged UI, Clear, local settings, CSV and XLSX worker checks passed · v{__version__}')
                 app.exit(0)
             except Exception as exc:
                 print(f'Self-test failed: {exc}', file=sys.stderr)

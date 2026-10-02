@@ -3,6 +3,21 @@ from zipfile import ZipFile
 from xml.sax.saxutils import escape
 
 
+class MemoryKeychain:
+    """Synthetic vault for UI checks; never accesses the user's Keychain."""
+    def __init__(self):
+        self.items = {}
+
+    def get_password(self, service, account):
+        return self.items.get((service, account))
+
+    def set_password(self, service, account, password):
+        self.items[(service, account)] = password
+
+    def delete_password(self, service, account):
+        del self.items[(service, account)]
+
+
 def create_workbook(path):
     namespace = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
     def sheet(headers, values):

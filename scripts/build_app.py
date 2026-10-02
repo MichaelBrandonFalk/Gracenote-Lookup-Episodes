@@ -55,6 +55,7 @@ def main():
         '--name', name, '--target-architecture', 'arm64',
         '--osx-bundle-identifier', 'com.michaelbrandonfalk.gracenote-episode-lookup',
         '--add-binary', f'{manager}:selenium/webdriver/common/macos',
+        '--add-data', f'{ROOT / "gracenote_lookup" / "assets"}:gracenote_lookup/assets',
         '--exclude-module', 'PyQt5', '--exclude-module', 'PyQt6',
         '--exclude-module', 'PySide2', '--exclude-module', 'tkinter',
         '--distpath', str(ROOT / 'dist'), '--workpath', str(ROOT / 'build'),
@@ -75,6 +76,8 @@ def main():
     with zipfile.ZipFile(archive) as zipped:
         if not any(p.endswith('/macos/selenium-manager') for p in zipped.namelist()):
             raise SystemExit('Packaged app is missing Selenium Manager.')
+        if not any(p.endswith('/gracenote_lookup/assets/checkmark.svg') for p in zipped.namelist()):
+            raise SystemExit('Packaged app is missing its checkbox checkmark.')
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (args.output_dir / f'{asset_name}.sha256').write_text(f'{digest}  {asset_name}\n')
     manifest = {

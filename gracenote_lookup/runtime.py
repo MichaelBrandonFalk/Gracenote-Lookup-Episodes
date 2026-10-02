@@ -14,6 +14,7 @@ class Runtime:
     ask: object = builtins.input
     progress: object = lambda current, total: None
     rows: object = lambda rows: None
+    await_login: object = None
     cancelled: Event = field(default_factory=Event)
 
     def check(self):

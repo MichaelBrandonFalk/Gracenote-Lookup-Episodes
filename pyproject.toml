@@ -7,7 +7,7 @@ name = "gracenote-episode-lookup"
 dynamic = ["version"]
 description = "Desktop Gracenote movie, series and episode ID lookup for avails workbooks and CSVs"
 requires-python = ">=3.11"
-dependencies = ["selenium==4.39.0", "PySide6==6.11.2"]
+dependencies = ["selenium==4.39.0", "PySide6==6.11.2", "keyring==25.7.0; sys_platform == 'darwin'"]
 
 [project.optional-dependencies]
 build = ["pyinstaller==6.22.3"]
@@ -17,6 +17,9 @@ gracenote-episode-lookup = "gracenote_lookup.desktop:main"
 
 [tool.setuptools]
 packages = ["gracenote_lookup"]
+
+[tool.setuptools.package-data]
+gracenote_lookup = ["assets/*.svg"]
 
 [tool.setuptools.dynamic]
 version = {attr = "gracenote_lookup.__version__"}

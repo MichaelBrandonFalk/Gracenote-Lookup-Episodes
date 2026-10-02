@@ -10,6 +10,7 @@ from .browser import BASE_URL, GracenoteBrowser
 from .matching import canonicalize_title_for_match, normalize_season_value, valid_id
 from .pagination import match_episode, PaginationError
 from .runtime import runtime, RunCancelled
+from .sign_in import finish_sign_in
 
 
 def main(settings, browser_factory=None):
@@ -114,8 +115,7 @@ def main(settings, browser_factory=None):
                 driver.set_page_load_timeout(60)
                 browser = GracenoteBrowser(driver, settings['wait_timeout'])
                 driver.get(BASE_URL)
-                runtime.ask('Sign in to Gracenote in Chrome, then click Continue in this app.')
-                runtime.check()
+                finish_sign_in(browser)
             deferred = []
             for key, rows in groups.items():
                 if settings['second_pass_only'] or not process(browser, key, rows, False):
