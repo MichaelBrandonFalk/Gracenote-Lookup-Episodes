@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gracenote Episode Lookup · Downloads</title>
+  <meta name="description" content="Download the versioned macOS app for Gracenote episode TMS ID lookup.">
+  <style>
+    :root{color-scheme:light;font-family:system-ui,-apple-system,sans-serif;color:#20362f;background:#f3f6f3}
+    *{box-sizing:border-box}body{margin:0;padding:64px 24px}main{max-width:920px;margin:auto}
+    .eyebrow{font-size:13px;font-weight:650;letter-spacing:.09em;text-transform:uppercase;color:#63786a}
+    h1{font-size:clamp(34px,5vw,56px);line-height:1.08;letter-spacing:-.04em;margin:18px 0;max-width:740px}
+    .intro{font-size:19px;line-height:1.6;color:#5f7066;max-width:650px}.panel{background:white;border:1px solid #d7e1d9;border-radius:16px;padding:28px;margin:28px 0}
+    .download{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:24px}
+    h2{margin:0 0 10px;font-size:23px}.muted{color:#66766c;line-height:1.5}.button{display:inline-block;padding:14px 22px;background:#21664d;color:white;border-radius:8px;text-decoration:none;font-weight:650}
+    a{color:#21664d}a:focus-visible{outline:3px solid #a3cbbb;outline-offset:4px}ol{padding-left:22px;line-height:1.9}small{display:block;margin-top:10px;font-size:13px}
+    .features{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}.features strong{display:block;margin-bottom:8px}.release{display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:16px 0;border-top:1px solid #e3e9e3}.release a:first-child{font-weight:650}.release span{flex:1;color:#66766c}footer{display:flex;gap:24px;flex-wrap:wrap;font-size:14px;margin-top:32px}
+    @media(max-width:640px){body{padding:32px 16px}.panel{padding:22px}.features{grid-template-columns:1fr}.button{width:100%;text-align:center}}
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Michael Brandon Falk · Desktop tools</div>
+  <h1>Gracenote IDs.<br>From your workbook to your app.</h1>
+  <p class="intro">Choose an avails workbook or episode CSV, sign in to Gracenote, and look up movie, series and episode IDs in a desktop app.</p>
+  <section class="panel download" aria-label="Latest app download">
+    <div><h2 id="version">Gracenote Episode Lookup</h2><div class="muted">macOS 13+ · Apple Silicon · Chrome required</div><small class="muted" id="download-status" aria-live="polite">Checking the latest published release…</small></div>
+    <a class="button" id="download" href="https://github.com/MichaelBrandonFalk/Gracenote-Lookup-Episodes/releases/latest">View latest release</a>
+  </section>
+  <section class="features" aria-label="Features">
+    <div><strong>Use files you already have</strong><div class="muted">Fill blank retailer IDs in Movie and TV avails tabs. Keep existing values and workbook formatting.</div></div>
+    <div><strong>Review uncertain matches</strong><div class="muted">Choose between programs with the same title. Uncertain IDs stay blank and appear in a review report.</div></div>
+    <div><strong>Keep your progress</strong><div class="muted">Results save after each row. Stop and resume, with a backup of earlier output.</div></div>
+  </section>
+  <section class="panel"><h2>Getting started</h2><ol><li>Download and unzip the app, then open it.</li><li>Choose an XLSX workbook or CSV and where to save results.</li><li>Click Start lookup, sign in directly in Chrome, and Continue.</li><li>Review your results and open the output file and review report.</li></ol><p class="muted">The app includes Python. You need an existing Gracenote View account. This build is ad-hoc signed; macOS may ask you to allow it in Privacy &amp; Security on first launch.</p></section>
+  <section class="panel"><h2>Release history</h2><p class="muted">Every release keeps its own app version and original download. Earlier releases stay available.</p><div id="releases" aria-live="polite"><a href="https://github.com/MichaelBrandonFalk/Gracenote-Lookup-Episodes/releases">Browse all releases on GitHub</a></div></section>
+  <footer><a href="https://github.com/MichaelBrandonFalk/Gracenote-Lookup-Episodes">Source and instructions</a><a href="https://github.com/MichaelBrandonFalk/Gracenote-Lookup-Episodes/issues">Report a problem</a><a href="https://MichaelBrandonFalk.github.io/Mikeys-Sweet-Suite/">Mikey’s Sweet Suite</a></footer>
+</main>
+<script>
+  const repo='MichaelBrandonFalk/Gracenote-Lookup-Episodes';
+  const safeURL=value=>{const u=new URL(value);if(u.protocol!=='https:'||u.hostname!=='github.com'||!u.pathname.startsWith('/'+repo+'/releases/'))throw Error('Unexpected release URL');return u.href;};
+  const link=(label,url)=>{const a=document.createElement('a');a.textContent=label;a.href=safeURL(url);return a;};
+  async function loadReleases(){
+    try{
+      const response=await fetch('https://api.github.com/repos/'+repo+'/releases?per_page=100',{signal:AbortSignal.timeout(10000)});
+      if(!response.ok)throw Error('Release list unavailable');
+      const releases=(await response.json()).filter(r=>!r.draft&&!r.prerelease&&/^v\d+\.\d+\.\d+$/.test(r.tag_name));
+      const builds=releases.map(r=>({release:r,asset:r.assets.find(a=>a.name==='Gracenote_Episode_Lookup_'+r.tag_name+'_macOS_arm64.zip')})).filter(b=>b.asset);
+      builds.sort((a,b)=>{const av=a.release.tag_name.slice(1).split('.').map(Number),bv=b.release.tag_name.slice(1).split('.').map(Number);for(let i=0;i<3;i++)if(av[i]!==bv[i])return bv[i]-av[i];return 0;});
+      if(!builds.length){document.getElementById('download-status').textContent='A packaged release is being prepared. Check GitHub for updates.';return;}
+      const latest=builds[0];
+      document.getElementById('version').textContent='Gracenote Episode Lookup '+latest.release.tag_name;
+      const download=document.getElementById('download');download.href=safeURL(latest.asset.browser_download_url);download.textContent='Download for Apple Silicon';
+      document.getElementById('download-status').textContent=latest.release.tag_name+' · '+(latest.asset.size/1048576).toFixed(1)+' MB · ZIP';
+      const history=document.getElementById('releases');history.replaceChildren();
+      for(const build of builds){const row=document.createElement('div');row.className='release';row.append(link(build.release.tag_name,build.release.html_url));const date=document.createElement('span');date.textContent=new Date(build.release.published_at).toLocaleDateString();row.append(date,link('Download ZIP',build.asset.browser_download_url),link('Release notes',build.release.html_url));history.append(row);}
+    }catch(error){document.getElementById('download-status').textContent='See GitHub Releases for current downloads and previous versions.';}
+  }
+  loadReleases();
+</script>
+</body>
+</html>

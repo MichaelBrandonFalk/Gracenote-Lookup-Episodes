@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+downloads/
+*.spec
+*.backup_*.csv
+*.backup_*.xlsx
+*with_tms_ids.xlsx
+*_lookup_report.csv
+*with_tms_ids.csv
+OutputEpisodes*.csv
+.pytest_cache/
+output/
